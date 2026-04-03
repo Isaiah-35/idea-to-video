@@ -1,0 +1,9 @@
+openai-whisper
+kokoro>=0.9
+soundfile
+numpy
+pyttsx3
+ordered_set
+pypinyin
+cn2an
+jieba
