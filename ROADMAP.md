@@ -235,3 +235,92 @@ Not a form — a conversation. This is where the 10x product lives.
 
 **This is a thinking tool that happens to produce videos.**
 The category doesn't exist yet. That's the point.
+
+---
+
+## Phase 3.5 — Visual Generation Strategy (Research + Implementation)
+
+*Research date: April 2026. Replaces static JPG/title-card requirement.*
+
+### The Problem
+
+The current pipeline requires users to either upload JPG images or accept plain dark title cards.
+Both are dead ends: uploaded images require pre-existing assets, title cards look like a prototype.
+The market has moved: in 2026 generic stock footage carries an "AI slop" signal on YouTube's
+algorithm. Users want visuals that actually match their content — not just the first search result
+for "productivity."
+
+### Research: What Competitors Do For Visuals
+
+| Tier | Tools | Method | Verdict |
+|------|-------|--------|---------|
+| **1 — Full synthesis** | Sora, Kling 2.0, LTX-2.3, Runway Gen-4 | Text → video from scratch | Commercial quality; expensive; requires GPU or $0.60+/clip |
+| **2 — Stock + AI match** | InVideo AI, Pictory | 3–16M stock assets, AI keyword match | "Generic" complaint is universal; stock look = low credibility by 2026 |
+| **3 — Avatar-led** | HeyGen, Synthesia | Talking head is the video | Requires clean script; no idea development |
+| **We are here** | idea-to-video | Static title cards or uploaded JPGs | Zero friction, zero quality |
+
+### Research: Open-Source Video Generation (Mac Reality Check)
+
+Local T2V on Apple Silicon is **not practical for an unattended pipeline** today:
+
+| Model | Stars | License | Mac Local | Min RAM | API Option | Cost/clip |
+|-------|-------|---------|-----------|---------|------------|-----------|
+| Wan 2.1 14B | 15.7K | Apache 2.0 | ✗ (needs 180 GB) | 180 GB | fal.ai, Replicate | $0.20–0.40 |
+| Wan 2.1 1.3B | 15.7K | Apache 2.0 | ⚠ (MPS fallback, slow) | 32 GB | fal.ai, Replicate | $0.20 |
+| LTX-2.3 | 9.8K | Apache 2.0 | ⚠ (via native Mac app, 32 GB) | 32 GB | fal.ai | $0.06–0.12/s |
+| CogVideoX-5B | ~10K | Apache 2.0 | ⚠ (20× slower than GPU) | 32 GB | Replicate | $0.40 |
+| AnimateDiff | 12.1K | Apache 2.0 | ✓ (MPS, 16 GB, I2V) | 16 GB | Replicate | $0.10 |
+| HunyuanVideo | ~13K | Non-commercial | ✗ (128 GB RAM) | 128 GB | fal.ai | $0.30 |
+
+**Conclusion:** for a solo Mac developer, local T2V generation is viable only for experimentation.
+The production path is a cloud API with a local fallback chain.
+
+### Research: Free Stock APIs
+
+| API | Free tier | Video? | Rate limit | Key insight |
+|-----|-----------|--------|------------|-------------|
+| **Pexels** | Unlimited (req attribution) | ✓ HD + 4K MP4 | 200 req/hr, 20K/month | Best: direct MP4 download links, hotlink OK |
+| **Unsplash** | 50 req/hr (demo) / 5K (production) | ✗ photos only | 50–5K/hr | Best photo quality; must trigger download event |
+| **Pixabay** | 100 req/min | ✓ + illustrations | 100/min | No hotlink; must cache server-side |
+
+### The Market Signal
+
+Users on Reddit/YouTube/ProductHunt 2025-2026 in priority order:
+1. **Own footage** (screencast, webcam) — highest trust signal
+2. **AI-generated that actually matches** — willing to pay $0.20–0.50/clip if visually coherent
+3. **Well-curated stock** — acceptable if not obviously generic
+4. **Auto-selected stock** — "I can always tell it's InVideo AI"
+
+The "stock look" is now an active YouTube algorithmic risk (AI labeling policy 2026).
+Users want *control* over what visual goes with each section, not auto-selection.
+
+### The Fallback Chain (What We Build)
+
+```
+For each scene:
+  1. User-uploaded images/video  → use as-is (existing)
+  2. Ken Burns effect            → animate title cards with ffmpeg pan+zoom (free, no API)
+  3. Pexels stock video          → search by image_prompt keyword, download best MP4 (free, PEXELS_API_KEY)
+  4. fal.ai Wan 2.1              → AI generate 5s clip from image_prompt ($0.20, FAL_KEY)
+  5. Pillow title card           → fallback of last resort (always works)
+```
+
+"Auto" mode walks the chain from #2 down based on available API keys.
+The user can pin any source per-run from Tab 7 or Tab 9.
+
+### Phase 3.5 — Actions
+
+- [x] `visual_sources.py` — unified visual acquisition with fallback chain (Ken Burns → Pexels → fal.ai → title card)
+- [x] `assemble_video.py` — replace `make_video.sh` for video-clip inputs; handles both image slideshows and MP4 clip concat via ffmpeg
+- [x] Ken Burns effect: ffmpeg `zoompan` filter on each title card — `scale=8000:-1` pre-step, `z='min(zoom+0.0015,1.5)'`, `s=1920x1080:fps=25` — produces cinematic animated slide, zero new deps
+- [x] Pexels integration: `GET /videos/search?query={image_prompt}&per_page=3&orientation=landscape` → download first `sd` quality MP4 → fallback to kenburns on empty results
+- [x] fal.ai integration: `fal-ai/wan-t2v` with `image_prompt` as prompt, 480p, 81 frames; guarded by try/except ImportError
+- [x] Tab 7: "Visual source" dropdown — Auto / Ken Burns / Pexels / fal.ai / Pillow
+- [x] Tab 9: API key status fields for PEXELS_API_KEY and FAL_KEY (read-only, from env)
+- [x] Update `run_full_pipeline` to call `visual_sources` instead of `_make_slide_images`
+
+**Eval:**
+- Does the Ken Burns effect make the output look like a real YouTube video vs a slideshow?
+- Does Pexels stock retrieval return visually relevant clips >70% of the time for typical topics?
+- Is total pipeline cost with fal.ai clearly shown before running?
+- Does the fallback chain degrade gracefully when API keys are missing?

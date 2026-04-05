@@ -19,7 +19,8 @@ from speak import text_to_speech
 from generate_images import generate_images
 from hook_variants import generate_hook_variants
 from repurpose import extract_clips
-from settings import load_settings, save_settings
+from settings import load_settings, save_settings, get_api_key_status
+from visual_sources import acquire_visuals, detect_available_backends
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -342,6 +343,7 @@ def run_make_video(audio_path, durations_path, image_files, topics_json):
 def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
                       b_name, b_audience, b_tone, b_style,
                       pp_goal, pp_aud, pp_emo, pp_cta,
+                      visual_src,
                       progress=gr.Progress()):
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
     pp = {"goal": pp_goal, "audience": pp_aud, "emotion": pp_emo, "cta": pp_cta}
@@ -383,27 +385,49 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
     full_script = "\n\n".join(sections)
     status = log(f"✓ Step 3/5 · Script written ({len(sections)} sections)")
 
-    # Step 3.5: Generate images
-    progress(0.52, desc="Step 3.5/5 · Generating images…")
+    # Step 3.5: Acquire visuals
+    progress(0.52, desc="Step 3.5/5 · Acquiring visuals…")
     img_dir = Path(tempfile.mkdtemp(prefix="itv_pipeline_imgs_"))
     generated_image_paths: list[str | None] = []
+    scenes_with_visuals: list[dict] = []
     if image_files:
         for i, img_path in enumerate(sorted(image_files), start=1):
             src = Path(img_path)
             dst = img_dir / f"img{i:03d}.jpg"
             dst.write_bytes(src.read_bytes())
             generated_image_paths.append(str(dst))
+        # Treat uploaded images as pillow type for assembly
+        scenes_with_visuals = build_scene_graph(topics, sections)
+        for i, s in enumerate(scenes_with_visuals):
+            s = dict(s)
+            s["visual_path"] = generated_image_paths[i] if i < len(generated_image_paths) else None
+            s["visual_type"] = "image"
+            scenes_with_visuals[i] = s
         status = log(f"  (using {len(image_files)} uploaded images)")
     else:
         try:
-            result_scenes = generate_images(topics, img_dir, backend="auto", overwrite=True)
-            generated_image_paths = [s.get("image_path") for s in result_scenes]
-            status = log(f"✓ Step 3.5/5 · {len(generated_image_paths)} images generated")
+            scenes_for_visuals = build_scene_graph(topics, sections)
+            scenes_with_visuals = acquire_visuals(
+                scenes_for_visuals, img_dir,
+                backend=visual_src,
+                progress_callback=lambda i, total, src: progress(
+                    0.52 + 0.08 * (i / total),
+                    desc=f"Step 3.5/5 · Generating visuals ({src}, {i}/{total})…"
+                ),
+            )
+            generated_image_paths = [s.get("visual_path") for s in scenes_with_visuals]
+            status = log(f"✓ Step 3.5/5 · {len(generated_image_paths)} visuals acquired ({visual_src})")
         except Exception as e:
-            # Non-fatal: fall back to inline image generation
+            # Non-fatal: fall back to pillow title cards
             _make_slide_images(topics, img_dir)
             generated_image_paths = [str(img_dir / f"img{i+1:03d}.jpg") for i in range(len(topics))]
-            status = log(f"  (image generation warning: {e} — using title cards)")
+            scenes_with_visuals = build_scene_graph(topics, sections)
+            for i, s in enumerate(scenes_with_visuals):
+                s = dict(s)
+                s["visual_path"] = generated_image_paths[i]
+                s["visual_type"] = "image"
+                scenes_with_visuals[i] = s
+            status = log(f"  (visual acquisition warning: {e} — using title cards)")
 
     # Step 4: Generate TTS
     progress(0.68, desc="Step 4/5 · Generating Kokoro TTS (local, free)…")
@@ -419,15 +443,29 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
     # Step 5: Assemble video
     progress(0.84, desc="Step 5/5 · Assembling video with ffmpeg (local, free)…")
     video_out = Path(tempfile.mktemp(suffix=".mp4"))
-    script_sh = Path(__file__).parent / "make_video.sh"
-    result = subprocess.run(
-        ["bash", str(script_sh), str(img_dir), str(audio_out), str(video_out), str(durations_out)],
-        capture_output=True, text=True,
-    )
 
-    ffmpeg_log = (result.stdout + result.stderr).strip()
-    if not video_out.exists() or video_out.stat().st_size < 1000:
-        return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), ""
+    # Update scenes_with_visuals with per-section durations
+    for i, s in enumerate(scenes_with_visuals):
+        s = dict(s)
+        s["duration_s"] = durations[i] if i < len(durations) else None
+        scenes_with_visuals[i] = s
+
+    visual_types = {s.get("visual_type") for s in scenes_with_visuals}
+    if "video" in visual_types:
+        try:
+            from assemble_video import assemble
+            assemble(audio_out, scenes_with_visuals, video_out)
+        except Exception as e:
+            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video assembly failed: {e}"), ""
+    else:
+        script_sh = Path(__file__).parent / "make_video.sh"
+        result = subprocess.run(
+            ["bash", str(script_sh), str(img_dir), str(audio_out), str(video_out), str(durations_out)],
+            capture_output=True, text=True,
+        )
+        ffmpeg_log = (result.stdout + result.stderr).strip()
+        if not video_out.exists() or video_out.stat().st_size < 1000:
+            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), ""
 
     progress(1.0, desc="Done!")
     status = log(f"✓ Step 5/5 · Video ready ({video_out.stat().st_size // 1024} KB)")
@@ -701,6 +739,13 @@ with gr.Blocks(title="idea-to-video") as demo:
                 p_topics = gr.Slider(1, 10, value=5, step=1, label="Topics")
                 p_style  = gr.Dropdown(STYLES, value="conversational", label="Style")
                 p_voice  = gr.Dropdown(KOKORO_VOICES["en"], value="af_heart", label="TTS voice")
+            with gr.Row():
+                p_visual_src = gr.Dropdown(
+                    ["auto", "kenburns", "pexels", "fal", "pillow"],
+                    value="auto",
+                    label="Visual source",
+                    info="auto = best available based on API keys set in Tab 9",
+                )
 
             with gr.Accordion("Pre-production context (optional — sets video intent)", open=False):
                 gr.Markdown(
@@ -787,6 +832,16 @@ with gr.Blocks(title="idea-to-video") as demo:
                 label="API key status",
                 value=("✓ ANTHROPIC_API_KEY set" if os.environ.get("ANTHROPIC_API_KEY")
                        else "✗ ANTHROPIC_API_KEY not set"),
+                interactive=False,
+            )
+            cfg_pexels_status = gr.Textbox(
+                label="Pexels API key",
+                value=get_api_key_status()["pexels"],
+                interactive=False,
+            )
+            cfg_fal_status = gr.Textbox(
+                label="fal.ai API key",
+                value=get_api_key_status()["fal"],
                 interactive=False,
             )
             with gr.Row():
@@ -891,7 +946,8 @@ with gr.Blocks(title="idea-to-video") as demo:
         run_full_pipeline,
         [p_audio, p_lang, p_model, p_topics, p_style, p_voice, p_images,
          b_name, b_aud, b_tone, b_style,
-         pp7_goal, pp7_aud, pp7_emo, pp7_cta],
+         pp7_goal, pp7_aud, pp7_emo, pp7_cta,
+         p_visual_src],
         [p_video, p_transcript, p_topics_out, p_script_out, p_status, p_session_info],
     )
     p_run.click(lambda _: gr.update(visible=False), p_status, p_session_info)

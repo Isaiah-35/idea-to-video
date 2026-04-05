@@ -191,6 +191,19 @@ def generate_images(
     return result
 
 
+# ── Visual sources helper ──────────────────────────────────────────────────────
+
+def generate_title_card_for_scene(scene: dict, output_path: Path) -> Path:
+    """Generate a single Pillow title card for a scene. Returns output_path."""
+    output_path = Path(output_path)
+    result = generate_images([scene], output_path.parent, backend="pillow", overwrite=True)
+    # rename img001.jpg to output_path if different
+    generated = Path(result[0]["image_path"])
+    if generated.resolve() != output_path.resolve():
+        generated.rename(output_path)
+    return output_path
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
