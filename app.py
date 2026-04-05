@@ -913,4 +913,4 @@ with gr.Blocks(title="idea-to-video") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(share=False, show_api=True)
+    demo.launch()
