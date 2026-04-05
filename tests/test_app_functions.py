@@ -19,15 +19,16 @@ _EMPTY_PP    = ("", "", "", "")   # pp_goal, pp_aud, pp_emo, pp_cta
 # ── run_transcribe ────────────────────────────────────────────────────────────
 
 def test_run_transcribe_no_audio():
-    result = _app.run_transcribe(None, "auto", "base")
+    result = _app.run_transcribe(None, "auto", "base", "", "", "")
     assert "Record or upload" in result
 
 
 def test_run_transcribe_with_file(silent_wav):
     mock_model = MagicMock()
-    mock_model.transcribe.return_value = {"text": "hello world"}
-    with patch("transcribe.whisper.load_model", return_value=mock_model):
-        result = _app.run_transcribe(str(silent_wav), "auto", "base")
+    mock_model.transcribe.return_value = {"text": "hello world", "segments": []}
+    with patch("transcribe._BACKEND", "whisper"), \
+         patch("transcribe.whisper.load_model", return_value=mock_model):
+        result = _app.run_transcribe(str(silent_wav), "auto", "base", "", "", "")
     assert result == "hello world"
 
 

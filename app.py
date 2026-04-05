@@ -12,7 +12,7 @@ import gradio as gr
 from brand import load_brand, save_brand, brand_prefix
 from preproduction import load_preproduction, save_preproduction, preproduction_prefix
 from session import save_session, load_latest_session, build_scene_graph
-from transcribe import transcribe, label_speakers
+from transcribe import transcribe
 from extract_topics import extract_topics
 from write_script import write_script, write_script_sections, STYLES
 from kokoro_tts import generate, generate_sections
@@ -114,27 +114,24 @@ def run_preview_brand(name, audience, tone, style_notes):
 
 # ── Tab 1: Transcribe ─────────────────────────────────────────────────────────
 
-def run_transcribe(audio_path, lang, model):
+def run_transcribe(audio_path, lang, model, speaker_a, speaker_b, hints):
     if audio_path is None:
         return "Record or upload an audio file first."
     language = None if lang == "auto" else lang
-    with tempfile.TemporaryDirectory() as tmp:
-        text = transcribe(Path(audio_path), language=language, model_name=model, output_dir=Path(tmp))
-    return text
-
-
-def run_label_speakers(transcript, speaker_a, speaker_b, hints):
-    if not transcript.strip():
-        return "Transcribe audio first.", gr.update()
-    a = speaker_a.strip() or "Speaker A"
-    b = speaker_b.strip() or "Speaker B"
+    a = speaker_a.strip() if speaker_a else ""
+    b = speaker_b.strip() if speaker_b else ""
+    speaker_names = [a, b] if a and b else None
     claude_model = load_settings()["claude_model"]
-    try:
-        labeled = label_speakers(transcript, speaker_a=a, speaker_b=b,
-                                 hints=hints, model=claude_model)
-        return f"✓ Labeled {a} and {b}", labeled
-    except Exception as e:
-        return f"Error: {e}", gr.update()
+    with tempfile.TemporaryDirectory() as tmp:
+        text = transcribe(
+            Path(audio_path),
+            language=language,
+            model_name=model,
+            output_dir=Path(tmp),
+            speaker_names=speaker_names,
+            speaker_hints=hints or "",
+        )
+    return text
 
 
 # ── Tab 2: Extract Topics ─────────────────────────────────────────────────────
@@ -645,32 +642,26 @@ with gr.Blocks(title="idea-to-video") as demo:
 
         # ── Tab 1: Transcribe ──
         with gr.Tab("1 · Transcribe", id=1):
-            gr.Markdown("Record live or upload audio → speech-to-text (WhisperX if installed, else Whisper).")
+            gr.Markdown(
+                "Upload or record audio → labeled transcript in one step.\n\n"
+                "**For conversations:** fill in speaker names before clicking Transcribe. "
+                "WhisperX diarization is used when `HF_TOKEN` is set; otherwise Claude "
+                "infers turns from conversational patterns. Leave names blank for solo recordings."
+            )
             t_audio = gr.Audio(label="Audio", sources=["microphone", "upload"], type="filepath")
             with gr.Row():
                 t_lang  = gr.Dropdown(["auto", "en", "zh"], value="auto", label="Language")
                 t_model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="base", label="Whisper model")
+            with gr.Row():
+                t_speaker_a = gr.Textbox(label="Speaker A name", placeholder="e.g. Paul (leave blank for solo)", scale=1)
+                t_speaker_b = gr.Textbox(label="Speaker B name", placeholder="e.g. Sam (leave blank for solo)", scale=1)
+            t_hints = gr.Textbox(
+                label="Speaker hints (optional — helps Claude distinguish voices)",
+                placeholder="e.g. Paul asks most questions. Sam explains technical details. Paul comments last.",
+                lines=2,
+            )
             t_run  = gr.Button("Transcribe", variant="primary")
-            t_out  = gr.Textbox(label="Transcript", lines=8)
-
-            with gr.Accordion("Label speakers (for interviews / conversations)", open=False):
-                gr.Markdown(
-                    "Got a conversation between two people? Claude reads the transcript and labels "
-                    "who said what — no audio re-processing needed.\n\n"
-                    "The labeled transcript flows into Extract Topics, which will then attribute "
-                    "insights, questions, and positions to each person by name."
-                )
-                with gr.Row():
-                    t_speaker_a = gr.Textbox(label="Speaker A name", placeholder="e.g. Paul", scale=1)
-                    t_speaker_b = gr.Textbox(label="Speaker B name", placeholder="e.g. Sam", scale=1)
-                t_hints = gr.Textbox(
-                    label="Optional hints (helps Claude distinguish voices)",
-                    placeholder="e.g. Paul asks most of the questions. Sam explains technical details.",
-                    lines=2,
-                )
-                t_label_btn    = gr.Button("Label Speakers", variant="primary")
-                t_label_status = gr.Textbox(label="Status", interactive=False, lines=1)
-
+            t_out  = gr.Textbox(label="Transcript", lines=10)
             t_send = gr.Button("→ Extract Topics")
 
         # ── Tab 2: Extract Topics ──
@@ -917,12 +908,7 @@ with gr.Blocks(title="idea-to-video") as demo:
     # ── Wire pipeline ─────────────────────────────────────────────────────────
 
     # Tab 1 → Tab 2
-    t_run.click(run_transcribe, [t_audio, t_lang, t_model], t_out)
-    t_label_btn.click(
-        run_label_speakers,
-        [t_out, t_speaker_a, t_speaker_b, t_hints],
-        [t_label_status, t_out],
-    )
+    t_run.click(run_transcribe, [t_audio, t_lang, t_model, t_speaker_a, t_speaker_b, t_hints], t_out)
     t_send.click(lambda t: (t, gr.update(selected=2)), t_out, [e_transcript, tabs])
 
     # Tab 2 → Tab 3
