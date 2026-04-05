@@ -17,6 +17,7 @@ def write_script(
     style: str = "conversational",
     brand: dict | None = None,
     extra_context: str = "",
+    model: str = "claude-sonnet-4-6",
 ) -> str:
     """Write a TTS-ready spoken script from a list of topic dicts. Returns full script."""
     client = Anthropic()
@@ -25,7 +26,7 @@ def write_script(
     topics_text = "\n".join(f"- {t['title']}: {t['summary']}" for t in topics)
 
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=2048,
         messages=[{
             "role": "user",
@@ -52,6 +53,7 @@ def write_script_sections(
     style: str = "conversational",
     brand: dict | None = None,
     extra_context: str = "",
+    model: str = "claude-sonnet-4-6",
 ) -> list[str]:
     """Write a TTS script split into one section per topic.
 
@@ -65,7 +67,7 @@ def write_script_sections(
     n = len(topics)
 
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=2048,
         messages=[{
             "role": "user",

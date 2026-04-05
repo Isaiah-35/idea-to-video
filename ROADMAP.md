@@ -161,8 +161,8 @@ They think out loud. The system builds.
 - [x] REC-4: Session persistence — `session.py` + auto-save + Resume button
 - [x] REC-5: Recording-first UI — Tab 7 hero redesigned around mic input
 - [x] REC-6: Stage-named progress — "Step N/5 · [stage]" throughout pipeline
-- [ ] REC-7: Brand voice before/without comparison toggle (Phase 3)
-- [ ] REC-8: Settings page with detailed cost estimator (Phase 3)
+- [x] REC-7: Brand voice before/without comparison toggle — "Brand impact" accordion in Tab 3 with word-level diff HTML
+- [x] REC-8: Settings page with detailed cost estimator — Tab 9 with model selector, per-model pricing, live cost estimate
 
 **Eval:**
 - Does pre-production context change what Claude generates? (Compare script divergence with/without)
@@ -171,32 +171,35 @@ They think out loud. The system builds.
 
 ---
 
-### Phase 3 — Narrative Coherence (20 → 40 weeks)
+### Phase 3 — Narrative Coherence ✅ COMPLETE (April 2026)
 *Make multi-scene videos that don't fall apart.*
 
 **Actions:**
-- [ ] Scene graph: represent the video as a directed sequence of scenes with explicit dependencies (character X appears, referenced in scene 3, must match scene 1)
-- [ ] Character consistency layer: persistent character image embeddings fed to every image generation call
-- [ ] Semantic editing: "make this section more urgent" → re-generates affected scenes, not the whole video
-- [ ] Hook A/B testing: auto-generate 3 opening variants, present side-by-side, commit to winner
-- [ ] Open model video generation: integrate Wan 2.1 for animated clips to replace static image slideshows
+- [x] Scene graph lite (`session.build_scene_graph`): zip topics + sections + image paths + durations into structured scene dicts; saved in every full pipeline session
+- [x] Image generation (`generate_images.py`): Pillow title cards (1920×1080) with gradient bg, badge, title, image prompt; DALL-E 3 backend optional; auto fallback to Pillow when no API key; integrated in Tab 3 storyboard accordion and Tab 7 pipeline step 3.5
+- [x] Hook A/B testing (`hook_variants.py`): generate 3 opening variants (Curiosity / Empathy / Authority) via Claude; Tab 3 "Hook variants" accordion; pick → prepend to script
+- [x] Brand comparison (REC-7): Tab 3 "Brand impact" accordion; side-by-side word-level diff of script with vs without brand context
+- [ ] Character consistency layer: persistent character image embeddings fed to every image generation call (deferred)
+- [ ] Semantic editing: "make this section more urgent" → re-generates affected scenes, not the whole video (deferred)
+- [ ] Open model video generation: integrate Wan 2.1 for animated clips to replace static image slideshows (deferred)
 
 **Eval:**
 - Watch the output video cold (no context) — does it tell a coherent story?
-- Do characters look the same in scene 1 and scene 5?
-- Does "make this more urgent" produce a measurably different result without breaking adjacent scenes?
+- Does the selected hook measurably change the opening feel of the video?
+- Does the brand diff show clear additions that match the brand tone?
 
 ---
 
-### Phase 4 — Platform (40+ weeks)
+### Phase 4 — Platform (started April 2026)
 *The workflow that replaces the 5-subscription stack.*
 
 **Actions:**
-- [ ] Brand memory: persistent store of visual identity, tone, audience, past scripts — loads automatically
-- [ ] Clip repurposing: long video → short-form clips with auto-selected hooks (Opus Clip's feature, owned by you)
-- [ ] Multi-language: WhisperX transcript → write_script in target language → Kokoro zh/en TTS → localized video
-- [ ] Collaboration: shared brand context, multiple contributors, version history
-- [ ] API: expose the pipeline as endpoints so others can build on it
+- [x] Clip repurposing (`repurpose.py`): long video → per-scene clips via ffmpeg; merge_short_scenes greedy grouping; Tab 10 "Repurpose" with video input, scenes JSON auto-fill, max-duration slider, ZIP download
+- [x] Settings persistence (`settings.py`): Claude model selector, Whisper backend, cost estimator; Tab 9; settings read by all Claude-calling handlers
+- [x] API enabled: `demo.launch(show_api=True)` exposes Gradio API for programmatic access
+- [ ] Brand memory: persistent store of visual identity, tone, audience, past scripts — loads automatically (deferred)
+- [ ] Multi-language: WhisperX transcript → write_script in target language → Kokoro zh/en TTS → localized video (deferred)
+- [ ] Collaboration: shared brand context, multiple contributors, version history (deferred)
 
 **Eval:**
 - Does a team of 3 non-technical people produce 10 videos/week without a video editor?
