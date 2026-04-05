@@ -211,7 +211,12 @@ def _acquire_fal(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[
                 "frames_per_second": 16,
             }
         })
-        urllib.request.urlretrieve(fal_result["video"]["url"], str(out_path))
+        video_url = (fal_result.get("video") or {}).get("url")
+        if not video_url:
+            raise RuntimeError(
+                f"fal.ai returned unexpected response shape for scene {i}: {fal_result!r}"
+            )
+        urllib.request.urlretrieve(video_url, str(out_path))
         scene["visual_path"] = str(out_path)
         scene["visual_type"] = "video"
         result[i] = scene
@@ -232,10 +237,10 @@ def acquire_visuals(
     """
     Acquire one visual asset per scene. Returns scenes with "visual_path" (str) set.
 
-    Fallback order for "auto":
-      1. kenburns (always available — animates title card via ffmpeg zoompan)
-      2. pexels   (if PEXELS_API_KEY env var is set)
-      3. fal      (if FAL_KEY env var is set — Wan 2.1 T2V via fal.ai)
+    Priority order for "auto" (highest quality first):
+      1. fal      (if FAL_KEY env var is set — Wan 2.1 T2V via fal.ai)
+      2. pexels   (if PEXELS_API_KEY env var is set — stock video)
+      3. kenburns (always available — animates title card via ffmpeg zoompan)
       4. pillow   (static title card, always works)
 
     Each backend sets scene["visual_path"] and scene["visual_type"] ("video"|"image").
