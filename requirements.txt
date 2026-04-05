@@ -1,9 +1,14 @@
+gradio
+anthropic
 openai-whisper
 kokoro>=0.9
 soundfile
 numpy
+Pillow
 pyttsx3
 ordered_set
 pypinyin
 cn2an
 jieba
+# optional: whisperx  (install separately for word-level timestamps + diarization)
+# pip install whisperx
