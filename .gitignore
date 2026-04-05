@@ -7,3 +7,6 @@ __pycache__/
 *.jpg
 *.aiff
 .gstack/
+.venv/
+preproduction.json
+sessions.json

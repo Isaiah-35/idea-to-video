@@ -92,12 +92,11 @@ def run_transcribe(audio_path, lang, model):
 # ── Tab 2: Extract Topics ─────────────────────────────────────────────────────
 
 def run_extract_topics(transcript, num_topics, lang,
-                       b_name, b_audience, b_tone, b_style,
-                       pp_goal, pp_aud, pp_emo, pp_cta):
+                       b_name, b_audience, b_tone, b_style):
     if not transcript.strip():
         return "Paste or transcribe text first.", "[]"
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
-    extra = _extra_context(pp_goal, pp_aud, pp_emo, pp_cta)
+    extra = preproduction_prefix()   # auto-loads from preproduction.json
     try:
         topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang,
                                 brand=brand, extra_context=extra)
@@ -113,8 +112,7 @@ def run_extract_topics(transcript, num_topics, lang,
 # ── Tab 3: Write Script ───────────────────────────────────────────────────────
 
 def run_write_script(topics_json, lang, style,
-                     b_name, b_audience, b_tone, b_style,
-                     pp_goal, pp_aud, pp_emo, pp_cta):
+                     b_name, b_audience, b_tone, b_style):
     try:
         topics = json.loads(topics_json)
     except json.JSONDecodeError:
@@ -122,7 +120,7 @@ def run_write_script(topics_json, lang, style,
     if not topics:
         return "No topics found. Run Extract Topics first.", "[]", ""
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
-    extra = _extra_context(pp_goal, pp_aud, pp_emo, pp_cta)
+    extra = preproduction_prefix()   # auto-loads from preproduction.json
     sections = write_script_sections(topics, lang=lang, style=style, brand=brand, extra_context=extra)
     full_script = "\n\n".join(sections)
     storyboard = _build_storyboard(topics, sections)
@@ -350,12 +348,6 @@ with gr.Blocks(title="idea-to-video") as demo:
     b_tone  = gr.State(_b["tone"])
     b_style = gr.State(_b["style_notes"])
 
-    # Shared pre-production state (hidden, loaded once, synced from Tab 8)
-    pp_goal = gr.State(_pp["goal"])
-    pp_aud  = gr.State(_pp["audience"])
-    pp_emo  = gr.State(_pp["emotion"])
-    pp_cta  = gr.State(_pp["cta"])
-
     with gr.Tabs() as tabs:
 
         # ── Tab 0: Brand ──
@@ -534,9 +526,6 @@ with gr.Blocks(title="idea-to-video") as demo:
                           outputs=[pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp, pp_status])
             pp_save.click(run_save_preproduction,
                           [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp], pp_status)
-            pp_save.click(lambda g, a, e, c: (g, a, e, c),
-                          [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp],
-                          [pp_goal, pp_aud, pp_emo, pp_cta])
             pp_preview.click(run_preview_preproduction,
                              [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp], pp_preview_out)
 
@@ -548,17 +537,13 @@ with gr.Blocks(title="idea-to-video") as demo:
 
     # Tab 2 → Tab 3
     e_run.click(run_extract_topics,
-                [e_transcript, e_num, e_lang,
-                 b_name, b_aud, b_tone, b_style,
-                 pp_goal, pp_aud, pp_emo, pp_cta],
+                [e_transcript, e_num, e_lang, b_name, b_aud, b_tone, b_style],
                 [e_display, e_json])
     e_send.click(lambda j: (j, gr.update(selected=3)), e_json, [w_topics, tabs])
 
     # Tab 3 → Tab 4
     w_run.click(run_write_script,
-                [w_topics, w_lang, w_style,
-                 b_name, b_aud, b_tone, b_style,
-                 pp_goal, pp_aud, pp_emo, pp_cta],
+                [w_topics, w_lang, w_style, b_name, b_aud, b_tone, b_style],
                 [w_out, w_sections, w_storyboard])
     w_run.click(lambda s: s, w_out, k_text)
     w_run.click(lambda s: s, w_sections, k_sections)
