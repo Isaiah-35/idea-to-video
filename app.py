@@ -1,6 +1,7 @@
 """Gradio UI for the idea-to-video pipeline — Phase 2 + 3 + 4."""
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -71,23 +72,24 @@ def _diff_html(script_a: str, script_b: str, label_a: str = "Without brand",
                label_b: str = "With brand") -> str:
     """Return side-by-side HTML showing word-level additions in script_b vs script_a."""
     import difflib
+    import html as _html
     words_a = script_a.split()
     words_b = script_b.split()
     sm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
     highlighted = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
-            highlighted.extend(words_b[j1:j2])
+            highlighted.extend(_html.escape(w) for w in words_b[j1:j2])
         elif tag in ("replace", "insert"):
             for w in words_b[j1:j2]:
-                highlighted.append(f'<span style="background:#1a4a1a;color:#6fda6f;">{w}</span>')
+                highlighted.append(f'<span style="background:#1a4a1a;color:#6fda6f;">{_html.escape(w)}</span>')
         # deletions are simply omitted from the "with brand" side
 
     with_brand_html = " ".join(highlighted)
     return (
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">'
         f'<div><strong style="color:#aaa">{label_a}</strong>'
-        f'<p style="color:#ccc;font-size:0.9em;white-space:pre-wrap;">{script_a}</p></div>'
+        f'<p style="color:#ccc;font-size:0.9em;white-space:pre-wrap;">{_html.escape(script_a)}</p></div>'
         f'<div><strong style="color:#6fda6f">{label_b}</strong>'
         f'<p style="color:#ccc;font-size:0.9em;">{with_brand_html}</p></div>'
         '</div>'
@@ -356,7 +358,7 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         return "\n".join(log_lines)
 
     if audio is None:
-        return None, None, "[]", "", "Record or upload audio first.", ""
+        return None, None, "[]", "", "Record or upload audio first.", "", ""
 
     # Step 1: Transcribe
     progress(0.05, desc="Step 1/5 · Transcribing audio…")
@@ -371,7 +373,7 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang,
                                 brand=brand, extra_context=extra, model=claude_model)
     except Exception as e:
-        return None, transcript, "[]", "[]", log(f"✗ Step 2/5 · Extract topics failed: {e}"), ""
+        return None, transcript, "[]", "[]", log(f"✗ Step 2/5 · Extract topics failed: {e}"), "", ""
     topics_json = json.dumps(topics, ensure_ascii=False, indent=2)
     status = log(f"✓ Step 2/5 · Extracted {len(topics)} topics")
 
@@ -381,7 +383,7 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         sections = write_script_sections(topics, lang=lang, style=style,
                                          brand=brand, extra_context=extra, model=claude_model)
     except Exception as e:
-        return None, transcript, topics_json, "[]", log(f"✗ Step 3/5 · Write script failed: {e}"), ""
+        return None, transcript, topics_json, "[]", log(f"✗ Step 3/5 · Write script failed: {e}"), "", ""
     full_script = "\n\n".join(sections)
     status = log(f"✓ Step 3/5 · Script written ({len(sections)} sections)")
 
@@ -438,7 +440,8 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         durations_out.write_text("\n".join(f"{d:.3f}" for d in durations), "utf-8")
         status = log(f"✓ Step 4/5 · TTS generated ({sum(durations):.1f}s total)")
     except Exception as e:
-        return None, transcript, topics_json, full_script, log(f"✗ Step 4/5 · TTS failed: {e}"), ""
+        shutil.rmtree(img_dir, ignore_errors=True)
+        return None, transcript, topics_json, full_script, log(f"✗ Step 4/5 · TTS failed: {e}"), "", ""
 
     # Step 5: Assemble video
     progress(0.84, desc="Step 5/5 · Assembling video with ffmpeg (local, free)…")
@@ -456,7 +459,8 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
             from assemble_video import assemble
             assemble(audio_out, scenes_with_visuals, video_out)
         except Exception as e:
-            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video assembly failed: {e}"), ""
+            shutil.rmtree(img_dir, ignore_errors=True)
+            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video assembly failed: {e}"), "", ""
     else:
         script_sh = Path(__file__).parent / "make_video.sh"
         result = subprocess.run(
@@ -465,7 +469,8 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         )
         ffmpeg_log = (result.stdout + result.stderr).strip()
         if not video_out.exists() or video_out.stat().st_size < 1000:
-            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), ""
+            shutil.rmtree(img_dir, ignore_errors=True)
+            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), "", ""
 
     progress(1.0, desc="Done!")
     status = log(f"✓ Step 5/5 · Video ready ({video_out.stat().st_size // 1024} KB)")
@@ -491,8 +496,10 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         "preproduction": pp,
     })
     session_msg = f"Session saved: {session_path.name}"
+    scenes_json_out = json.dumps(scenes, ensure_ascii=False)
+    shutil.rmtree(img_dir, ignore_errors=True)
 
-    return str(video_out), transcript, topics_json, full_script, status, session_msg
+    return str(video_out), transcript, topics_json, full_script, status, session_msg, scenes_json_out
 
 
 # ── Tab 7: Session restore ────────────────────────────────────────────────────
@@ -948,14 +955,13 @@ with gr.Blocks(title="idea-to-video") as demo:
          b_name, b_aud, b_tone, b_style,
          pp7_goal, pp7_aud, pp7_emo, pp7_cta,
          p_visual_src],
-        [p_video, p_transcript, p_topics_out, p_script_out, p_status, p_session_info],
+        [p_video, p_transcript, p_topics_out, p_script_out, p_status, p_session_info, p_scenes_json],
     )
     p_run.click(lambda _: gr.update(visible=False), p_status, p_session_info)
     p_session_info.change(lambda v: gr.update(visible=bool(v)), p_session_info, p_session_info)
 
-    # Wire scenes JSON from Tab 7 to Tab 10
-    # (the full pipeline doesn't return scenes_json in its outputs to keep backward compat;
-    # we expose p_scenes_json as a separate hidden component that gets set by an extra handler)
+    # Auto-populate Tab 10 scenes from pipeline output
+    p_scenes_json.change(lambda v: v if v and v != "[]" else gr.update(), p_scenes_json, rp_scenes)
 
     # Resume last session
     resume_btn.click(run_resume_session, [],

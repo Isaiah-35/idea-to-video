@@ -88,7 +88,9 @@ def _kenburns_single(scene: dict, index: int, output_dir: Path, overwrite: bool)
     return str(out_path)
 
 
-def _acquire_kenburns(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[dict]:
+def _acquire_kenburns(
+    scenes: list[dict], output_dir: Path, overwrite: bool, progress_cb=None
+) -> list[dict]:
     """Animate each title card with Ken Burns zoompan. Returns scenes with visual_path set."""
     import shutil
     if not shutil.which("ffmpeg"):
@@ -96,19 +98,25 @@ def _acquire_kenburns(scenes: list[dict], output_dir: Path, overwrite: bool) -> 
             "ffmpeg is required for Ken Burns backend. Install it with: brew install ffmpeg"
         )
     result = list(scenes)
+    total = len(result)
     for i, scene in enumerate(result):
         scene = dict(scene)
         scene["visual_path"] = _kenburns_single(scene, i, output_dir, overwrite)
         scene["visual_type"] = "video"
         result[i] = scene
+        if progress_cb:
+            progress_cb(i + 1, total, "kenburns")
     return result
 
 
 # ── Pillow static ──────────────────────────────────────────────────────────────
 
-def _acquire_pillow(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[dict]:
+def _acquire_pillow(
+    scenes: list[dict], output_dir: Path, overwrite: bool, progress_cb=None
+) -> list[dict]:
     """Generate static Pillow title cards. Returns scenes with visual_path set."""
     result = list(scenes)
+    total = len(result)
     for i, scene in enumerate(result):
         scene = dict(scene)
         out_path = output_dir / f"scene{i + 1:03d}_pillow.jpg"
@@ -116,11 +124,13 @@ def _acquire_pillow(scenes: list[dict], output_dir: Path, overwrite: bool) -> li
             scene["visual_path"] = str(out_path)
             scene["visual_type"] = "image"
             result[i] = scene
-            continue
-        generate_title_card_for_scene(scene, out_path)
-        scene["visual_path"] = str(out_path)
-        scene["visual_type"] = "image"
-        result[i] = scene
+        else:
+            generate_title_card_for_scene(scene, out_path)
+            scene["visual_path"] = str(out_path)
+            scene["visual_type"] = "image"
+            result[i] = scene
+        if progress_cb:
+            progress_cb(i + 1, total, "pillow")
     return result
 
 
@@ -136,10 +146,13 @@ def _extract_keywords(image_prompt: str, max_words: int = 4) -> str:
     return " ".join(words[:max_words])
 
 
-def _acquire_pexels(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[dict]:
+def _acquire_pexels(
+    scenes: list[dict], output_dir: Path, overwrite: bool, progress_cb=None
+) -> list[dict]:
     """Download stock video from Pexels API for each scene."""
     api_key = os.environ["PEXELS_API_KEY"]
     result = list(scenes)
+    total = len(result)
 
     for i, scene in enumerate(result):
         scene = dict(scene)
@@ -178,13 +191,17 @@ def _acquire_pexels(scenes: list[dict], output_dir: Path, overwrite: bool) -> li
         scene["visual_path"] = str(out_path)
         scene["visual_type"] = "video"
         result[i] = scene
+        if progress_cb:
+            progress_cb(i + 1, total, "pexels")
 
     return result
 
 
 # ── fal.ai ────────────────────────────────────────────────────────────────────
 
-def _acquire_fal(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[dict]:
+def _acquire_fal(
+    scenes: list[dict], output_dir: Path, overwrite: bool, progress_cb=None
+) -> list[dict]:
     """Generate AI video via fal.ai Wan 2.1."""
     try:
         import fal_client  # noqa: F401
@@ -194,6 +211,7 @@ def _acquire_fal(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[
     import fal_client
 
     result = list(scenes)
+    total = len(result)
     for i, scene in enumerate(result):
         scene = dict(scene)
         out_path = output_dir / f"scene{i + 1:03d}_fal.mp4"
@@ -220,6 +238,8 @@ def _acquire_fal(scenes: list[dict], output_dir: Path, overwrite: bool) -> list[
         scene["visual_path"] = str(out_path)
         scene["visual_type"] = "video"
         result[i] = scene
+        if progress_cb:
+            progress_cb(i + 1, total, "fal")
 
     return result
 
@@ -248,20 +268,14 @@ def acquire_visuals(
     output_dir = Path(output_dir)
     effective = _auto_backend() if backend == "auto" else backend
 
-    total = len(scenes)
-
     if effective == "kenburns":
-        results = _acquire_kenburns(scenes, output_dir, overwrite)
+        results = _acquire_kenburns(scenes, output_dir, overwrite, progress_cb=progress_callback)
     elif effective == "pexels":
-        results = _acquire_pexels(scenes, output_dir, overwrite)
+        results = _acquire_pexels(scenes, output_dir, overwrite, progress_cb=progress_callback)
     elif effective == "fal":
-        results = _acquire_fal(scenes, output_dir, overwrite)
+        results = _acquire_fal(scenes, output_dir, overwrite, progress_cb=progress_callback)
     else:
-        results = _acquire_pillow(scenes, output_dir, overwrite)
-
-    if progress_callback:
-        for i in range(total):
-            progress_callback(i + 1, total, effective)
+        results = _acquire_pillow(scenes, output_dir, overwrite, progress_cb=progress_callback)
 
     return results
 
