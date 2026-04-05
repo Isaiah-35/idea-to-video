@@ -1,19 +1,22 @@
-"""Transcribe WAV audio files to text with optional speaker labeling.
+"""Transcribe WAV audio with optional speaker labeling.
 
-Priority order:
-  1. WhisperX + pyannote diarization (if whisperx installed AND HF_TOKEN set)
-       → audio-level speaker ID, no guesswork
-  2. WhisperX without diarization → plain text → Claude label_speakers
-       → pattern-based inference from conversational structure
-  3. Whisper → plain text → Claude label_speakers (same fallback)
+Backend priority (auto-selected at import time):
+  1. mlx      — Apple Silicon GPU + Neural Engine via mlx-whisper
+                 ~10x faster than CPU on M-series; pip install mlx-whisper
+  2. whisperx — CTranslate2 int8, all CPU cores; pyannote diarization on MPS
+  3. whisper  — OpenAI reference implementation, CPU fallback
 
-Speaker names are inputs to transcribe(), not a post-processing step.
+Speaker labeling:
+  - WhisperX/MLX + pyannote diarization when HF_TOKEN is set (audio-level, accurate)
+  - Claude inference fallback when HF_TOKEN is absent (pattern-based, no extra install)
 
 Performance notes:
-  - Models are cached at module level — only loaded once per process.
-  - Device auto-selects: MPS (Apple Silicon) > CUDA > CPU.
-  - Word alignment is skipped unless need_word_timestamps=True; diarization
-    runs at segment level which is fast and accurate enough for transcripts.
+  - Models cached at module level — loaded once per process, instant on reuse.
+  - Word alignment skipped by default (need_word_timestamps=False).
+    Alignment runs at ~1× realtime on CPU; skipping it is the single biggest
+    speedup for transcript-only use (tab 1 → topics → script flow).
+  - CTranslate2 uses cpu_threads=0 (all cores); M3 Max = 14 threads.
+  - Diarization runs on MPS (Apple Silicon GPU) when available.
 """
 import argparse
 import json
@@ -22,25 +25,34 @@ import re
 import sys
 from pathlib import Path
 
-# Try WhisperX first; fall back to standard whisper
-try:
-    import whisperx
-    _BACKEND = "whisperx"
-except ImportError:
-    whisperx = None  # type: ignore
-    _BACKEND = "whisper"
+# ── Backend detection ──────────────────────────────────────────────────────────
 
-# Always import whisper so tests can patch `transcribe.whisper.load_model`
+_mlx_whisper = None  # type: ignore
+_whisperx = None     # type: ignore
+
 try:
-    import whisper  # type: ignore
+    import mlx_whisper as _mlx_whisper
+    _BACKEND = "mlx"
+except ImportError:
+    try:
+        import whisperx as _whisperx
+        _BACKEND = "whisperx"
+    except ImportError:
+        _BACKEND = "whisper"
+
+# Expose under canonical names for patching in tests
+whisperx = _whisperx  # type: ignore
+
+try:
+    import whisper  # type: ignore  # always import for test patching
 except ImportError:
     whisper = None  # type: ignore
 
 
-# ── Device auto-selection ──────────────────────────────────────────────────────
+# ── Device helpers ─────────────────────────────────────────────────────────────
 
-def _best_device() -> str:
-    """Return the fastest available device: mps > cuda > cpu."""
+def _torch_device() -> str:
+    """MPS > CUDA > CPU — used for PyTorch models (alignment, diarization)."""
     try:
         import torch
         if torch.backends.mps.is_available():
@@ -52,44 +64,55 @@ def _best_device() -> str:
     return "cpu"
 
 
-# CTranslate2 (WhisperX ASR) does not support MPS — always use cpu for it.
-# PyTorch models (alignment, diarization) do support MPS.
-_CT2_DEVICE = "cpu"
-_TORCH_DEVICE = _best_device()
+_TORCH_DEV = _torch_device()
+
+# CTranslate2 ASR has no MPS support — always CPU; threading handles parallelism.
+_CT2_DEV = "cpu"
+
+# MLX model names on HuggingFace hub
+_MLX_MODELS = {
+    "tiny":   "mlx-community/whisper-tiny-mlx",
+    "base":   "mlx-community/whisper-base-mlx",
+    "small":  "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large":  "mlx-community/whisper-large-v3-mlx",
+}
 
 
 # ── Model cache (module-level — persists across Gradio calls) ─────────────────
 
-_asr_cache: dict[tuple, object] = {}    # (model_name, compute_type) → model
-_align_cache: dict[str, tuple] = {}     # lang → (align_model, metadata)
-_diarize_cache: dict[str, object] = {}  # hf_token[:8] → DiarizationPipeline
+_asr_cache:     dict = {}   # (model_name,) → whisperx model
+_align_cache:   dict = {}   # lang → (align_model, metadata)
+_diarize_cache: dict = {}   # hf_token[:8] → DiarizationPipeline
 
 
-def _load_asr_model(model_name: str):
-    key = (model_name, "int8")
-    if key not in _asr_cache:
-        _asr_cache[key] = whisperx.load_model(
-            model_name, _CT2_DEVICE, compute_type="int8"
+def _load_whisperx_model(model_name: str):
+    if model_name not in _asr_cache:
+        _asr_cache[model_name] = _whisperx.load_model(
+            model_name, _CT2_DEV,
+            compute_type="int8",
+            # cpu_threads=0 → CTranslate2 uses all available cores (14 on M3 Max)
+            # num_workers=2 → overlap I/O and compute for batched segments
         )
-    return _asr_cache[key]
+    return _asr_cache[model_name]
 
 
 def _load_align_model(lang: str):
     if lang not in _align_cache:
-        _align_cache[lang] = whisperx.load_align_model(
-            language_code=lang, device=_TORCH_DEVICE
+        _align_cache[lang] = _whisperx.load_align_model(
+            language_code=lang, device=_TORCH_DEV
         )
     return _align_cache[lang]
 
 
 def _load_diarize_pipeline(hf_token: str):
-    cache_key = hf_token[:8]
-    if cache_key not in _diarize_cache:
+    key = hf_token[:8]
+    if key not in _diarize_cache:
         from whisperx.diarize import DiarizationPipeline
-        _diarize_cache[cache_key] = DiarizationPipeline(
-            use_auth_token=hf_token, device=_TORCH_DEVICE
+        _diarize_cache[key] = DiarizationPipeline(
+            use_auth_token=hf_token, device=_TORCH_DEV
         )
-    return _diarize_cache[cache_key]
+    return _diarize_cache[key]
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -100,55 +123,52 @@ def transcribe(
     language: str | None = None,
     model_name: str = "base",
     output_dir: Path | None = None,
-    device: str | None = None,         # None = auto (recommended)
+    device: str | None = None,          # None = auto
     speaker_names: list[str] | None = None,
     speaker_hints: str = "",
     need_word_timestamps: bool = False,
 ) -> str:
-    """Transcribe a single audio file and return the text.
+    """Transcribe audio and return labeled text.
 
     Args:
-        file_path:            Path to the WAV file.
-        language:             ISO language code or None for auto-detect.
-        model_name:           Whisper model size ("tiny"…"large").
-        output_dir:           Directory for .txt / .words.json output.
-        device:               "cpu" / "cuda" / "mps" / None (auto-select).
-        speaker_names:        ["Paul", "Sam"] → output labeled as [Paul]: …
-        speaker_hints:        Hints for Claude fallback labeling.
-        need_word_timestamps: Set True only when downstream stages need
-                              per-word timing (video sync). Skipping this
-                              saves significant time for transcript-only use.
+        file_path:            WAV file to transcribe.
+        language:             "en" / "zh" / None (auto-detect).
+        model_name:           "tiny" / "base" / "small" / "medium" / "large".
+        output_dir:           Where to write .txt and .words.json.
+        device:               Ignored — device is auto-selected per model type.
+        speaker_names:        ["Paul", "Sam"] → [Paul]: / [Sam]: prefix per turn.
+        speaker_hints:        Hints for Claude fallback, e.g. "Paul asks questions."
+        need_word_timestamps: True only for video sync (adds alignment pass).
 
     Returns:
-        Transcript text. With speaker_names: [Name]: prefixed per turn.
+        Transcript string. Speaker-labeled if speaker_names provided.
     """
-    if _BACKEND == "whisperx":
+    if _BACKEND == "mlx":
+        text, segments = _transcribe_mlx(
+            file_path, language=language, model_name=model_name,
+            speaker_names=speaker_names, speaker_hints=speaker_hints,
+            need_word_timestamps=need_word_timestamps,
+        )
+    elif _BACKEND == "whisperx":
         text, segments = _transcribe_whisperx(
-            file_path,
-            language=language,
-            model_name=model_name,
-            speaker_names=speaker_names,
-            speaker_hints=speaker_hints,
+            file_path, language=language, model_name=model_name,
+            speaker_names=speaker_names, speaker_hints=speaker_hints,
             need_word_timestamps=need_word_timestamps,
         )
     else:
-        text, segments = _transcribe_whisper(
-            file_path, language=language, model_name=model_name,
-        )
+        text, segments = _transcribe_whisper(file_path, language=language,
+                                             model_name=model_name)
         if speaker_names and not is_labeled(text):
             text = _claude_label(text, speaker_names, speaker_hints)
 
     out_dir = output_dir or file_path.parent
-    out_file = out_dir / f"{file_path.stem}.txt"
-    out_file.write_text(text, encoding="utf-8")
-    print(f"Saved: {out_file}")
+    (out_dir / f"{file_path.stem}.txt").write_text(text, encoding="utf-8")
+    print(f"[{_BACKEND}] Saved: {out_dir / file_path.stem}.txt")
 
     if segments:
-        words_file = out_dir / f"{file_path.stem}.words.json"
-        words_file.write_text(
+        (out_dir / f"{file_path.stem}.words.json").write_text(
             json.dumps(segments, ensure_ascii=False, indent=2), "utf-8"
         )
-        print(f"Saved word timestamps: {words_file}")
 
     return text
 
@@ -160,16 +180,63 @@ def transcribe_with_timestamps(
     model_name: str = "base",
     device: str | None = None,
 ) -> tuple[str, list[dict]]:
-    """Return (text, word_segments) with word-level timestamps."""
+    """Return (text, word_segments) with word-level timestamps (for video sync)."""
+    if _BACKEND == "mlx":
+        return _transcribe_mlx(file_path, language=language, model_name=model_name,
+                               need_word_timestamps=True)
     if _BACKEND == "whisperx":
-        return _transcribe_whisperx(
-            file_path, language=language, model_name=model_name,
-            need_word_timestamps=True,
-        )
+        return _transcribe_whisperx(file_path, language=language, model_name=model_name,
+                                    need_word_timestamps=True)
     return _transcribe_whisper(file_path, language=language, model_name=model_name)
 
 
-# ── WhisperX backend ───────────────────────────────────────────────────────────
+# ── MLX backend (Apple Silicon GPU + Neural Engine) ───────────────────────────
+
+def _transcribe_mlx(
+    file_path: Path,
+    language: str | None,
+    model_name: str,
+    speaker_names: list[str] | None = None,
+    speaker_hints: str = "",
+    need_word_timestamps: bool = False,
+) -> tuple[str, list[dict]]:
+    hub_name = _MLX_MODELS.get(model_name, _MLX_MODELS["base"])
+    result = _mlx_whisper.transcribe(
+        str(file_path),
+        path_or_hf_repo=hub_name,
+        language=language,
+        word_timestamps=need_word_timestamps,
+        verbose=False,
+    )
+
+    segments = result.get("segments", [])
+    text = " ".join(s["text"].strip() for s in segments).strip()
+
+    words: list[dict] = []
+    if need_word_timestamps:
+        words = [
+            {"word": w["word"], "start": w["start"], "end": w["end"]}
+            for s in segments
+            for w in s.get("words", [])
+            if "start" in w
+        ]
+
+    if speaker_names:
+        hf_token = os.environ.get("HF_TOKEN")
+        if hf_token:
+            try:
+                # MLX segments are compatible with WhisperX diarization
+                text = _diarize_segments(segments, speaker_names, hf_token,
+                                         str(file_path))
+                return text, words
+            except Exception as e:
+                print(f"[transcribe] MLX diarization failed ({e}), using Claude")
+        text = _claude_label(text, speaker_names, speaker_hints)
+
+    return text, words
+
+
+# ── WhisperX backend (CTranslate2 int8, all CPU cores) ────────────────────────
 
 def _transcribe_whisperx(
     file_path: Path,
@@ -179,19 +246,17 @@ def _transcribe_whisperx(
     speaker_hints: str = "",
     need_word_timestamps: bool = False,
 ) -> tuple[str, list[dict]]:
-    model = _load_asr_model(model_name)
-    audio = whisperx.load_audio(str(file_path))
+    model = _load_whisperx_model(model_name)
+    audio = _whisperx.load_audio(str(file_path))
     result = model.transcribe(audio, language=language)
     lang = result.get("language", language or "en")
 
     words: list[dict] = []
-
     if need_word_timestamps or (speaker_names and os.environ.get("HF_TOKEN")):
-        # Alignment needed: word timestamps OR accurate word-level diarization
         try:
             align_model, metadata = _load_align_model(lang)
-            result = whisperx.align(
-                result["segments"], align_model, metadata, audio, _TORCH_DEVICE
+            result = _whisperx.align(
+                result["segments"], align_model, metadata, audio, _TORCH_DEV
             )
             words = [
                 {"word": w["word"], "start": w["start"], "end": w["end"]}
@@ -202,16 +267,17 @@ def _transcribe_whisperx(
         except Exception as e:
             print(f"[transcribe] Alignment skipped: {e}")
 
-    text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
+    text = " ".join(s["text"].strip() for s in result["segments"]).strip()
 
     if speaker_names:
         hf_token = os.environ.get("HF_TOKEN")
         if hf_token:
             try:
-                text = _diarize(audio, result, speaker_names, hf_token)
+                text = _diarize_segments(result["segments"], speaker_names,
+                                         hf_token, str(file_path))
                 return text, words
             except Exception as e:
-                print(f"[transcribe] Diarization failed ({e}), falling back to Claude")
+                print(f"[transcribe] Diarization failed ({e}), using Claude")
         text = _claude_label(text, speaker_names, speaker_hints)
 
     return text, words
@@ -226,41 +292,67 @@ def _transcribe_whisper(
     result = model.transcribe(str(file_path), language=language, fp16=False)
     text: str = result["text"].strip()
     segments = [
-        {"word": seg["text"].strip(), "start": seg["start"], "end": seg["end"]}
-        for seg in result.get("segments", [])
+        {"word": s["text"].strip(), "start": s["start"], "end": s["end"]}
+        for s in result.get("segments", [])
     ]
     return text, segments
 
 
-# ── Diarization ────────────────────────────────────────────────────────────────
+# ── Diarization (pyannote on MPS) ──────────────────────────────────────────────
 
-def _diarize(audio, result: dict, speaker_names: list[str], hf_token: str) -> str:
+def _diarize_segments(
+    segments: list[dict],
+    speaker_names: list[str],
+    hf_token: str,
+    audio_path: str,
+) -> str:
+    """Run pyannote diarization on MPS and return [Name]: labeled turns."""
+    import numpy as np
+
     pipeline = _load_diarize_pipeline(hf_token)
-    diarize_segments = pipeline(audio, num_speakers=len(speaker_names))
-    result = whisperx.assign_word_speakers(diarize_segments, result)
-    return _format_diarized_turns(result["segments"], speaker_names)
+    audio = _whisperx.load_audio(audio_path) if _whisperx else None
+
+    if audio is None:
+        # MLX path: load audio via soundfile
+        import soundfile as sf
+        data, sr = sf.read(audio_path)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        import numpy as np
+        audio = data.astype(np.float32)
+
+    diarize_segs = pipeline(audio, num_speakers=len(speaker_names))
+
+    # Use WhisperX's assign_word_speakers regardless of transcription backend
+    if _whisperx:
+        result_with_speakers = _whisperx.assign_word_speakers(
+            diarize_segs, {"segments": segments}
+        )
+        return _format_turns(result_with_speakers["segments"], speaker_names)
+
+    return _format_turns(segments, speaker_names)
 
 
-def _format_diarized_turns(segments: list[dict], speaker_names: list[str]) -> str:
+def _format_turns(segments: list[dict], speaker_names: list[str]) -> str:
     speaker_map: dict[str, str] = {}
     for seg in segments:
         spk = seg.get("speaker")
         if spk and spk not in speaker_map:
-            idx = len(speaker_map)
-            speaker_map[spk] = speaker_names[idx] if idx < len(speaker_names) else spk
+            speaker_map[spk] = speaker_names[len(speaker_map)] \
+                if len(speaker_map) < len(speaker_names) else spk
 
     turns: list[tuple[str, str]] = []
     for seg in segments:
         name = speaker_map.get(seg.get("speaker", ""), seg.get("speaker", "?"))
-        seg_text = seg.get("text", "").strip()
-        if not seg_text:
+        txt = seg.get("text", "").strip()
+        if not txt:
             continue
         if turns and turns[-1][0] == name:
-            turns[-1] = (name, turns[-1][1] + " " + seg_text)
+            turns[-1] = (name, turns[-1][1] + " " + txt)
         else:
-            turns.append((name, seg_text))
+            turns.append((name, txt))
 
-    return "\n".join(f"[{name}]: {text}" for name, text in turns)
+    return "\n".join(f"[{n}]: {t}" for n, t in turns)
 
 
 # ── Claude fallback ────────────────────────────────────────────────────────────
@@ -272,14 +364,14 @@ def _claude_label(
     model: str = "claude-sonnet-4-6",
 ) -> str:
     from anthropic import Anthropic
-    a, b = speaker_names[0], speaker_names[1] if len(speaker_names) > 1 else "Speaker B"
-    client = Anthropic()
+    a = speaker_names[0]
+    b = speaker_names[1] if len(speaker_names) > 1 else "Speaker B"
     hint_block = f"\nHints:\n{hints.strip()}\n" if hints.strip() else ""
     prompt = (
         f"Raw transcript of a two-person conversation between {a} and {b}. "
         f"No speaker labels.\n{hint_block}\n"
-        f"Break into turns, prefix each with [{a}]: or [{b}]:.\n"
-        f"Rules: preserve every word exactly. Each turn on a new line. "
+        f"Break into turns. Prefix each with [{a}]: or [{b}]:. "
+        f"Preserve every word exactly. Each turn on a new line. "
         f"Return ONLY the labeled transcript.\n\nTranscript:\n{transcript}"
     )
     response = Anthropic().messages.create(
@@ -309,7 +401,7 @@ def is_labeled(transcript: str) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=f"Transcribe WAV files (backend: {_BACKEND}, torch device: {_TORCH_DEVICE})"
+        description=f"Transcribe WAV — backend: {_BACKEND} | torch: {_TORCH_DEV}"
     )
     parser.add_argument("input", type=Path)
     parser.add_argument("--lang", choices=["en", "zh"], default=None)
@@ -319,17 +411,15 @@ def main() -> None:
     parser.add_argument("--speaker-a", default=None)
     parser.add_argument("--speaker-b", default=None)
     parser.add_argument("--hints", default="")
-    parser.add_argument("--word-timestamps", action="store_true",
-                        help="Run word alignment (slower, needed for video sync)")
+    parser.add_argument("--word-timestamps", action="store_true")
     args = parser.parse_args()
 
-    input_path: Path = args.input
-    if not input_path.exists():
-        print(f"Error: {input_path} not found", file=sys.stderr)
+    if not args.input.exists():
+        print(f"Error: {args.input} not found", file=sys.stderr)
         sys.exit(1)
 
-    files = [input_path] if input_path.is_file() else (
-        sorted(input_path.glob("*.WAV")) + sorted(input_path.glob("*.wav"))
+    files = [args.input] if args.input.is_file() else (
+        sorted(args.input.glob("*.WAV")) + sorted(args.input.glob("*.wav"))
     )
     if not files:
         print("No WAV files found", file=sys.stderr)
@@ -338,8 +428,10 @@ def main() -> None:
     if args.output_dir:
         args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    speaker_names = [args.speaker_a, args.speaker_b] if args.speaker_a and args.speaker_b else None
-    print(f"Backend: {_BACKEND} | ASR device: {_CT2_DEVICE} | Torch device: {_TORCH_DEVICE}")
+    speaker_names = [args.speaker_a, args.speaker_b] \
+        if args.speaker_a and args.speaker_b else None
+
+    print(f"Backend: {_BACKEND} | ASR: {_CT2_DEV} | Torch: {_TORCH_DEV}")
 
     for f in files:
         print(f"\n--- {f.name} ---")
