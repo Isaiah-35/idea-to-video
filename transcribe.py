@@ -2,9 +2,13 @@
 
 Prefers WhisperX (word-level timestamps, speaker diarization) when available.
 Falls back to openai-whisper transparently.
+
+Speaker labeling (label_speakers) uses Claude to infer turn boundaries from
+conversational patterns — works without WhisperX or a HuggingFace token.
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -117,6 +121,71 @@ def _transcribe_whisper(
         for seg in result.get("segments", [])
     ]
     return text, segments
+
+
+# ── Speaker labeling ──────────────────────────────────────────────────────────
+
+def label_speakers(
+    transcript: str,
+    speaker_a: str = "Speaker A",
+    speaker_b: str = "Speaker B",
+    hints: str = "",
+    model: str = "claude-sonnet-4-6",
+) -> str:
+    """Re-format an undifferentiated transcript as labeled speaker turns.
+
+    Uses Claude to infer turn boundaries from conversational patterns
+    (question/answer rhythm, pronoun shifts, topic transitions).
+    Returns the same content with [speaker_a]: and [speaker_b]: prefixes.
+
+    Does NOT require WhisperX, pyannote, or a HuggingFace token.
+
+    Args:
+        transcript: Raw undifferentiated transcript text.
+        speaker_a:  Name for the first speaker (e.g. "Paul").
+        speaker_b:  Name for the second speaker (e.g. "Sam").
+        hints:      Optional cues to help Claude distinguish voices
+                    (e.g. "Paul asks most of the questions, Sam explains").
+        model:      Claude model to use.
+
+    Returns:
+        Transcript reformatted as labeled turns:
+            [Paul]: First thing Paul said...
+            [Sam]: Sam's response...
+    """
+    from anthropic import Anthropic
+
+    client = Anthropic()
+    hint_block = f"\nHints to help identify speakers:\n{hints.strip()}\n" if hints.strip() else ""
+
+    prompt = (
+        f"You are given a raw transcript of a two-person conversation between "
+        f"{speaker_a} and {speaker_b}. The transcript is one continuous block of text "
+        f"with no speaker labels.\n"
+        f"{hint_block}\n"
+        f"Your task: break the transcript into speaker turns and prefix each turn with "
+        f"[{speaker_a}]: or [{speaker_b}]:.\n\n"
+        f"Rules:\n"
+        f"- Preserve every word exactly as-is — do NOT paraphrase, summarize, or add anything.\n"
+        f"- Each new turn starts on a new line.\n"
+        f"- Use [{speaker_a}]: and [{speaker_b}]: as the only prefixes — no timestamps, "
+        f"no parenthetical notes.\n"
+        f"- If a passage is genuinely ambiguous, assign it to the most likely speaker and continue.\n"
+        f"- Return ONLY the labeled transcript — no preamble, no explanation.\n\n"
+        f"Transcript:\n{transcript}"
+    )
+
+    response = client.messages.create(
+        model=model,
+        max_tokens=8096,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+def is_labeled(transcript: str) -> bool:
+    """Return True if transcript already has [Speaker]: turn labels."""
+    return bool(re.search(r'^\[.+\]:', transcript, re.MULTILINE))
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
