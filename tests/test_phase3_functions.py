@@ -64,6 +64,8 @@ def test_generate_images_overwrite_false_skips(tmp_path):
 
 def test_generate_images_auto_backend_without_key_uses_pillow(tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.delenv("PEXELS_API_KEY", raising=False)
     result = generate_images(SAMPLE_SCENES[:1], tmp_path, backend="auto", overwrite=True)
     assert len(result) == 1
     assert Path(result[0]["image_path"]).exists()

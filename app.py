@@ -208,18 +208,19 @@ def run_generate_images_tab3(topics_json, sections_json):
     try:
         topics = json.loads(topics_json)
     except (json.JSONDecodeError, TypeError):
-        return [], "", "Invalid topics JSON."
+        return [], "", "Invalid topics JSON.", []
     if not topics:
-        return [], "", "No topics — run Extract Topics first."
+        return [], "", "No topics — run Extract Topics first.", []
 
     img_dir = Path(tempfile.mkdtemp(prefix="itv_imgs_"))
     try:
         result_scenes = generate_images(topics, img_dir, backend="auto", overwrite=True)
     except Exception as e:
-        return [], "", f"Error: {e}"
+        return [], "", f"Error: {e}", []
 
     gallery = [s["image_path"] for s in result_scenes if s.get("image_path")]
-    return gallery, str(img_dir), f"Generated {len(gallery)} images in {img_dir}"
+    # Return gallery twice: once for the Tab 3 gallery display, once to pre-fill Tab 6 v_images
+    return gallery, str(img_dir), f"Generated {len(gallery)} images in {img_dir}", gallery
 
 
 # ── Tab 3: Hook variants ──────────────────────────────────────────────────────
@@ -744,8 +745,8 @@ with gr.Blocks(title="idea-to-video") as demo:
                 "Leave images empty to auto-generate title cards from topic titles."
             )
             with gr.Row():
-                v_audio  = gr.Audio(label="Audio (WAV/MP3)", type="filepath")
-                v_images = gr.File(label="Images (JPG) — sorted by filename", file_count="multiple", file_types=["image"])
+                v_audio  = gr.Audio(label="Audio (auto-filled from Tab 4 TTS)", type="filepath")
+                v_images = gr.File(label="Images (auto-filled from Tab 3 Generate Images)", file_count="multiple", file_types=["image"])
             v_durations = gr.Textbox(label="Durations file (auto-filled from TTS)", visible=False)
             v_topics    = gr.Textbox(label="Topics JSON (for auto-slide generation)", visible=False)
             v_run   = gr.Button("Make Video", variant="primary")
@@ -928,11 +929,11 @@ with gr.Blocks(title="idea-to-video") as demo:
         [w_out, w_sections], [k_text, k_sections, tabs]
     )
 
-    # Tab 3: Generate images
+    # Tab 3: Generate images — 4th output pre-fills Tab 6 Make Video images
     w_gen_img_btn.click(
         run_generate_images_tab3,
         [w_topics, w_sections],
-        [w_gallery, w_images_dir, w_img_status],
+        [w_gallery, w_images_dir, w_img_status, v_images],
     )
     w_gen_img_btn.click(
         lambda: (gr.update(visible=True), gr.update(visible=True)),
@@ -960,9 +961,10 @@ with gr.Blocks(title="idea-to-video") as demo:
         [w_out, w_sections],
     )
 
-    # Tab 4
+    # Tab 4 — TTS audio and durations auto-fill Tab 6 Make Video
     k_run.click(run_kokoro, [k_text, k_sections, k_lang, k_voice],
                 [k_audio, k_durations, k_info])
+    k_run.click(lambda a: a, k_audio, v_audio)
     k_run.click(lambda d: d, k_durations, v_durations)
     e_run.click(lambda _, j: j, [e_display, e_json], v_topics)
 
