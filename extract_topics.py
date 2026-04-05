@@ -28,7 +28,7 @@ def extract_topics(
 
     response = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=4096,
         messages=[{
             "role": "user",
             "content": (
@@ -53,7 +53,14 @@ def _parse_json(text: str) -> list[dict]:
     if text.startswith("```"):
         text = text.split("\n", 1)[1]          # drop opening fence line
         text = text.rsplit("```", 1)[0]         # drop closing fence
-    return json.loads(text.strip())
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Surface a clear message if Claude truncated the response (max_tokens hit)
+        raise ValueError(
+            f"Claude returned malformed JSON (likely truncated — response was {len(text)} chars): {e}"
+        ) from e
 
 
 def main() -> None:
