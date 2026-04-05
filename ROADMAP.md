@@ -324,3 +324,68 @@ The user can pin any source per-run from Tab 7 or Tab 9.
 - Does Pexels stock retrieval return visually relevant clips >70% of the time for typical topics?
 - Is total pipeline cost with fal.ai clearly shown before running?
 - Does the fallback chain degrade gracefully when API keys are missing?
+
+---
+
+### Phase 3.6 — Image Quality Fix (Research complete, April 2026)
+
+*Root cause diagnosed. See [RESEARCH_IMAGE_QUALITY.md](RESEARCH_IMAGE_QUALITY.md) for full analysis.*
+
+#### The Problem
+
+Generated images score **2.25/10** (LLM judge). All four test topics failed with
+the same failure mode: `PROMPT_TOO_LITERAL`.
+
+The `image_prompt` field from `extract_topics()` is written for AI image generation
+(Midjourney/DALL-E style: glowing neurons, molecular diagrams, composite impossible
+scenes). When routed to Pexels stock photo search, these prompts return irrelevant
+results because Pexels only indexes real photographs — no one has ever photographed
+a "caffeine molecule blocking an adenosine receptor."
+
+**This is not a model problem. It is a prompt design problem.**
+
+Claude, given explicit B-roll framing rules, produced 100%-hit-rate Pexels queries
+in a single rewrite pass. The fix is to stop asking one field to serve two incompatible
+use cases.
+
+#### Root Cause Breakdown
+
+| Layer | Status | Issue |
+|-------|--------|-------|
+| **Prompt generation** (`extract_topics.py`) | ❌ Broken | `image_prompt` is framed for AI generation, not stock search |
+| **Query construction** (`generate_images.py`) | ⚠ Secondary | First-sentence truncation strips context; minor without fixing upstream |
+| **Pexels search** | ✓ Works | Returns excellent results for concrete, photographable queries |
+| **Generation model** (fal/dalle3) | ✓ Works | Handles abstract prompts well when balance is funded |
+
+#### The Fix: Two-Field Extraction
+
+Modify `extract_topics()` to emit two separate fields per topic:
+
+```jsonc
+{
+  "ai_image_prompt": "human brain with glowing hippocampus...",  // for fal/dalle3
+  "stock_query": "person sleeping open textbook beside bed"      // for pexels, ≤8 words
+}
+```
+
+`stock_query` generation rule added to the Claude prompt:
+> Describe a real, photographable scene a documentary filmmaker would use as B-roll.
+> Max 8 words. No molecules, diagrams, glowing overlays, or composite impossible scenes.
+> Translate the concept into a human action or object.
+
+`generate_images.py` uses `stock_query` when calling Pexels, `ai_image_prompt` when
+calling fal/dalle3.
+
+#### Quality Target
+
+After fix:
+- LLM judge average score ≥ 7/10 (from current 2.25/10)
+- Pexels top result visually relevant ≥ 80% of topics
+- Zero `PROMPT_TOO_LITERAL` failures
+
+#### Actions
+
+- [ ] `extract_topics.py`: rename `image_prompt` → `ai_image_prompt`; add `stock_query` field (max 8 words, B-roll framing rule in prompt)
+- [ ] `generate_images.py`: route `stock_query` to Pexels, `ai_image_prompt` to fal/dalle3; `_to_pexels_query()` Claude fallback for legacy topics missing `stock_query`
+- [ ] Update storyboard display in `app.py` to show both fields separately
+- [ ] `tests/eval/test_image_quality.py`: LLM judge test asserting avg score ≥ 7 and ≤ 8-word stock_query
