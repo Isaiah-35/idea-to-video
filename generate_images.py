@@ -1,4 +1,14 @@
-"""Generate title-card images for each scene (Pillow or DALL-E 3)."""
+"""Generate title-card images for each scene.
+
+Backend priority (auto):
+  1. fal      — fal.ai Flux Schnell (fast, cheap AI images); FAL_KEY required
+  2. dalle3   — OpenAI DALL-E 3 (high quality); OPENAI_API_KEY required
+  3. pexels   — Pexels stock photos (free, 200 req/hr); PEXELS_API_KEY required
+  4. pillow   — Local title cards (no API, always works)
+
+Set backend="auto" to use the best available option automatically.
+Any paid backend that hits a billing/quota error falls through to the next tier.
+"""
 import argparse
 import json
 import os
@@ -88,6 +98,77 @@ def _make_pillow_card(scene: dict, index: int) -> Image.Image:
     return img
 
 
+# ── fal.ai backend (Flux Schnell — fast, cheap AI images) ─────────────────────
+
+def _make_fal_card(scene: dict) -> bytes:
+    """Generate via fal.ai Flux Schnell. Returns raw JPEG bytes."""
+    import urllib.request
+    try:
+        import fal_client
+    except ImportError:
+        raise RuntimeError("fal backend requires fal-client: pip install fal-client")
+
+    api_key = os.environ.get("FAL_KEY")
+    if not api_key:
+        raise RuntimeError("fal backend requires FAL_KEY env var")
+
+    raw_prompt = scene.get("image_prompt") or scene.get("title", "abstract visual")
+    prompt = (
+        f"{raw_prompt}. "
+        "Cinematic wide shot, 16:9 landscape orientation, photorealistic, "
+        "high detail, no text overlays, no watermarks, no logos."
+    )
+    result = fal_client.subscribe(
+        "fal-ai/flux/schnell",
+        arguments={
+            "prompt": prompt,
+            "image_size": "landscape_16_9",
+            "num_images": 1,
+            "num_inference_steps": 4,
+        },
+    )
+    url = result["images"][0]["url"]
+    with urllib.request.urlopen(url) as r:
+        return r.read()
+
+
+# ── Pexels backend (free stock photos) ────────────────────────────────────────
+
+def _make_pexels_card(scene: dict) -> bytes:
+    """Fetch a relevant stock photo from Pexels. Returns raw image bytes."""
+    import urllib.request
+    import urllib.parse
+
+    api_key = os.environ.get("PEXELS_API_KEY")
+    if not api_key:
+        raise RuntimeError("pexels backend requires PEXELS_API_KEY env var")
+
+    # Build search query from image_prompt or title
+    raw = scene.get("image_prompt") or scene.get("title", "")
+    # Strip instruction-style suffixes and trim to key nouns for better results
+    query = raw.split(".")[0].strip()[:100]
+
+    search_url = (
+        "https://api.pexels.com/v1/search?"
+        + urllib.parse.urlencode({"query": query, "per_page": 1, "orientation": "landscape"})
+    )
+    req = urllib.request.Request(search_url, headers={
+        "Authorization": api_key,
+        "User-Agent": "idea-to-video/1.0",
+    })
+    with urllib.request.urlopen(req) as r:
+        data = json.loads(r.read())
+
+    photos = data.get("photos", [])
+    if not photos:
+        raise RuntimeError(f"Pexels: no results for query '{query}'")
+
+    img_url = photos[0]["src"]["large2x"]  # 2560px wide
+    img_req = urllib.request.Request(img_url, headers={"User-Agent": "idea-to-video/1.0"})
+    with urllib.request.urlopen(img_req) as r:
+        return r.read()
+
+
 # ── DALL-E 3 backend ───────────────────────────────────────────────────────────
 
 def _make_dalle3_card(scene: dict) -> bytes:
@@ -130,6 +211,36 @@ def _make_dalle3_card(scene: dict) -> bytes:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+_BILLING_SIGNALS = ("billing", "quota", "exhausted", "hard limit", "rate limit")
+
+
+def _is_billing_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(s in msg for s in _BILLING_SIGNALS) or "429" in str(e)
+
+
+def _resolve_auto_backend() -> str:
+    """Pick best available backend: fal → dalle3 → pexels → pillow."""
+    try:
+        import fal_client  # noqa: F401
+        if os.environ.get("FAL_KEY"):
+            return "fal"
+    except ImportError:
+        pass
+    try:
+        import openai as _oai
+        if hasattr(_oai, "OpenAI") and os.environ.get("OPENAI_API_KEY"):
+            return "dalle3"
+    except ImportError:
+        pass
+    if os.environ.get("PEXELS_API_KEY"):
+        return "pexels"
+    return "pillow"
+
+
+_FALLBACK_ORDER = ["fal", "dalle3", "pexels", "pillow"]
+
+
 def generate_images(
     scenes: list[dict],
     output_dir: Path,
@@ -143,9 +254,9 @@ def generate_images(
     Args:
         scenes: list of dicts with at least "title" and "image_prompt" keys.
         output_dir: must exist — caller is responsible for creating it.
-        backend: "pillow" | "dalle3" | "auto"
-            "auto" uses DALL-E 3 if OPENAI_API_KEY is set and openai>=1.0 is installed,
-            otherwise falls back to Pillow.
+        backend: "fal" | "dalle3" | "pexels" | "pillow" | "auto"
+            "auto" picks fal → dalle3 → pexels → pillow based on available keys.
+            Any paid backend that hits a billing/quota error falls through automatically.
         overwrite: if False, skip scenes where the output file already exists.
         progress_callback: optional callable(i, total) called after each image.
 
@@ -153,18 +264,7 @@ def generate_images(
         scenes list with "image_path" key added/updated for each generated image.
     """
     output_dir = Path(output_dir)
-
-    # Resolve effective backend
-    effective_backend = backend
-    if backend == "auto":
-        try:
-            import openai as _oai
-            if hasattr(_oai, "OpenAI") and os.environ.get("OPENAI_API_KEY"):
-                effective_backend = "dalle3"
-            else:
-                effective_backend = "pillow"
-        except ImportError:
-            effective_backend = "pillow"
+    effective_backend = _resolve_auto_backend() if backend == "auto" else backend
 
     result = list(scenes)
     total = len(result)
@@ -181,8 +281,36 @@ def generate_images(
             continue
 
         scene = dict(scene)
-        if effective_backend == "dalle3":
-            img_bytes = _make_dalle3_card(scene)
+        img_bytes: bytes | None = None
+
+        # Try current backend, cascade on billing/quota errors
+        current = effective_backend
+        while img_bytes is None:
+            try:
+                if current == "fal":
+                    img_bytes = _make_fal_card(scene)
+                elif current == "dalle3":
+                    img_bytes = _make_dalle3_card(scene)
+                elif current == "pexels":
+                    img_bytes = _make_pexels_card(scene)
+                else:
+                    break  # pillow path below
+            except Exception as e:
+                if _is_billing_error(e):
+                    # Find next backend in fallback chain
+                    idx = _FALLBACK_ORDER.index(current) if current in _FALLBACK_ORDER else -1
+                    if idx + 1 < len(_FALLBACK_ORDER):
+                        next_b = _FALLBACK_ORDER[idx + 1]
+                        print(f"[generate_images] {current} billing limit — falling back to {next_b}")
+                        # Cascade for all remaining scenes too
+                        effective_backend = next_b
+                        current = next_b
+                    else:
+                        break  # exhausted all API backends, use pillow
+                else:
+                    raise
+
+        if img_bytes:
             out_path.write_bytes(img_bytes)
         else:
             img = _make_pillow_card(scene, i)
@@ -216,7 +344,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate title-card images for video scenes")
     parser.add_argument("--scenes", type=Path, required=True, help="JSON file with scene list")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--backend", choices=["pillow", "dalle3", "auto"], default="auto")
+    parser.add_argument("--backend", choices=["fal", "dalle3", "pexels", "pillow", "auto"], default="auto")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
