@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import app as _app
 
 _EMPTY_BRAND = ("", "", "", "")   # b_name, b_aud, b_tone, b_style
+_EMPTY_PP    = ("", "", "", "")   # pp_goal, pp_aud, pp_emo, pp_cta
 
 
 # ── run_transcribe ────────────────────────────────────────────────────────────
@@ -33,7 +34,7 @@ def test_run_transcribe_with_file(silent_wav):
 # ── run_extract_topics ────────────────────────────────────────────────────────
 
 def test_run_extract_topics_empty_transcript():
-    display, json_out = _app.run_extract_topics("", 5, "en", *_EMPTY_BRAND)
+    display, json_out = _app.run_extract_topics("", 5, "en", *_EMPTY_BRAND, *_EMPTY_PP)
     assert "Paste" in display
     assert json_out == "[]"
 
@@ -45,7 +46,7 @@ def test_run_extract_topics_returns_display_and_json(sample_transcript, sample_t
     mock_client.messages.create.return_value = mock_response
 
     with patch("extract_topics.Anthropic", return_value=mock_client):
-        display, json_out = _app.run_extract_topics(sample_transcript, 2, "en", *_EMPTY_BRAND)
+        display, json_out = _app.run_extract_topics(sample_transcript, 2, "en", *_EMPTY_BRAND, *_EMPTY_PP)
 
     assert "Sleep and Memory" in display
     parsed = json.loads(json_out)
@@ -55,12 +56,14 @@ def test_run_extract_topics_returns_display_and_json(sample_transcript, sample_t
 # ── run_write_script ──────────────────────────────────────────────────────────
 
 def test_run_write_script_invalid_json():
-    full_script, sections_json = _app.run_write_script("not json", "en", "conversational", *_EMPTY_BRAND)
+    full_script, sections_json, storyboard = _app.run_write_script(
+        "not json", "en", "conversational", *_EMPTY_BRAND, *_EMPTY_PP)
     assert "Invalid" in full_script
 
 
 def test_run_write_script_empty_list():
-    full_script, sections_json = _app.run_write_script("[]", "en", "conversational", *_EMPTY_BRAND)
+    full_script, sections_json, storyboard = _app.run_write_script(
+        "[]", "en", "conversational", *_EMPTY_BRAND, *_EMPTY_PP)
     assert "No topics" in full_script
 
 
@@ -72,12 +75,14 @@ def test_run_write_script_success(sample_topics_json, sample_topics):
     mock_client.messages.create.return_value = mock_response
 
     with patch("write_script.Anthropic", return_value=mock_client):
-        full_script, sections_json = _app.run_write_script(sample_topics_json, "en", "conversational", *_EMPTY_BRAND)
+        full_script, sections_json, storyboard = _app.run_write_script(
+            sample_topics_json, "en", "conversational", *_EMPTY_BRAND, *_EMPTY_PP)
 
     assert "Section one." in full_script
     assert "Section two." in full_script
     parsed = json.loads(sections_json)
     assert len(parsed) == 2
+    assert "Slide 1" in storyboard  # storyboard HTML contains slide headers
 
 
 # ── run_kokoro ────────────────────────────────────────────────────────────────

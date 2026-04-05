@@ -14,14 +14,16 @@ def extract_topics(
     num_topics: int = 5,
     lang: str = "en",
     brand: dict | None = None,
+    extra_context: str = "",
 ) -> list[dict]:
     """Extract topics from transcript.
 
     Returns list of {title, summary, image_prompt}.
+    extra_context is prepended before brand_prefix in the prompt (use for pre-production intent).
     """
     client = Anthropic()
     lang_note = "Respond in Chinese." if lang == "zh" else "Respond in English."
-    ctx = brand_prefix(brand)
+    ctx = (extra_context.strip() + "\n\n" if extra_context.strip() else "") + brand_prefix(brand)
 
     response = client.messages.create(
         model="claude-sonnet-4-6",

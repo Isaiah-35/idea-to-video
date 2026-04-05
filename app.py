@@ -1,4 +1,4 @@
-"""Gradio UI for the idea-to-video pipeline."""
+"""Gradio UI for the idea-to-video pipeline — Phase 2."""
 import json
 import subprocess
 import tempfile
@@ -7,6 +7,8 @@ from pathlib import Path
 import gradio as gr
 
 from brand import load_brand, save_brand, brand_prefix
+from preproduction import load_preproduction, save_preproduction, preproduction_prefix
+from session import save_session, load_latest_session
 from transcribe import transcribe
 from extract_topics import extract_topics
 from write_script import write_script, write_script_sections, STYLES
@@ -30,16 +32,34 @@ def _make_slide_images(topics: list[dict], img_dir: Path) -> None:
         img = Image.new("RGB", (1920, 1080), color=(18, 18, 30))
         draw = ImageDraw.Draw(img)
         title = topic.get("title", f"Topic {i}")
-        # Try to find a usable font; fall back to default
         try:
             font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 96)
         except Exception:
             font = ImageFont.load_default()
-        # Center text
         bbox = draw.textbbox((0, 0), title, font=font)
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         draw.text(((1920 - w) // 2, (1080 - h) // 2), title, font=font, fill=(220, 220, 255))
         img.save(str(img_dir / f"img{i:03d}.jpg"), quality=92)
+
+
+def _build_storyboard(topics: list[dict], sections: list[str]) -> str:
+    """Return HTML card-per-topic storyboard view."""
+    cards = []
+    for i, (t, s) in enumerate(zip(topics, sections), start=1):
+        cards.append(
+            f'<div style="border:1px solid #555;border-radius:8px;padding:12px 16px;'
+            f'margin:8px 0;background:#1a1a2e;">'
+            f'<strong style="color:#a0a8ff;">Slide {i} · {t["title"]}</strong>'
+            f'<p style="margin:8px 0 4px;color:#ccc;">{s}</p>'
+            f'<small style="color:#888;">Image prompt: {t.get("image_prompt","—")}</small>'
+            f'</div>'
+        )
+    return "".join(cards) if cards else "<p style='color:#888'>Run Write Script to preview storyboard.</p>"
+
+
+def _extra_context(pp_goal, pp_aud, pp_emo, pp_cta) -> str:
+    pp = {"goal": pp_goal, "audience": pp_aud, "emotion": pp_emo, "cta": pp_cta}
+    return preproduction_prefix(pp)
 
 
 # ── Tab 0: Brand Context ──────────────────────────────────────────────────────
@@ -71,12 +91,16 @@ def run_transcribe(audio_path, lang, model):
 
 # ── Tab 2: Extract Topics ─────────────────────────────────────────────────────
 
-def run_extract_topics(transcript, num_topics, lang, b_name, b_audience, b_tone, b_style):
+def run_extract_topics(transcript, num_topics, lang,
+                       b_name, b_audience, b_tone, b_style,
+                       pp_goal, pp_aud, pp_emo, pp_cta):
     if not transcript.strip():
         return "Paste or transcribe text first.", "[]"
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
+    extra = _extra_context(pp_goal, pp_aud, pp_emo, pp_cta)
     try:
-        topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang, brand=brand)
+        topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang,
+                                brand=brand, extra_context=extra)
     except Exception as e:
         return f"Error: {e}", "[]"
     display = "\n\n".join(
@@ -88,17 +112,21 @@ def run_extract_topics(transcript, num_topics, lang, b_name, b_audience, b_tone,
 
 # ── Tab 3: Write Script ───────────────────────────────────────────────────────
 
-def run_write_script(topics_json, lang, style, b_name, b_audience, b_tone, b_style):
+def run_write_script(topics_json, lang, style,
+                     b_name, b_audience, b_tone, b_style,
+                     pp_goal, pp_aud, pp_emo, pp_cta):
     try:
         topics = json.loads(topics_json)
     except json.JSONDecodeError:
-        return "Invalid topics JSON. Run Extract Topics first.", "[]"
+        return "Invalid topics JSON. Run Extract Topics first.", "[]", ""
     if not topics:
-        return "No topics found. Run Extract Topics first.", "[]"
+        return "No topics found. Run Extract Topics first.", "[]", ""
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
-    sections = write_script_sections(topics, lang=lang, style=style, brand=brand)
+    extra = _extra_context(pp_goal, pp_aud, pp_emo, pp_cta)
+    sections = write_script_sections(topics, lang=lang, style=style, brand=brand, extra_context=extra)
     full_script = "\n\n".join(sections)
-    return full_script, json.dumps(sections, ensure_ascii=False, indent=2)
+    storyboard = _build_storyboard(topics, sections)
+    return full_script, json.dumps(sections, ensure_ascii=False, indent=2), storyboard
 
 
 # ── Tab 4: Kokoro TTS ─────────────────────────────────────────────────────────
@@ -155,7 +183,6 @@ def run_make_video(audio_path, durations_path, image_files, topics_json):
                 dst = img_dir_path / f"img{i:03d}.jpg"
                 dst.write_bytes(src.read_bytes())
         else:
-            # Auto-generate slide images from topic titles
             try:
                 topics = json.loads(topics_json) if topics_json and topics_json.strip() != "[]" else []
             except (json.JSONDecodeError, TypeError):
@@ -181,8 +208,12 @@ def run_make_video(audio_path, durations_path, image_files, topics_json):
 # ── Tab 7: Run Full Pipeline ──────────────────────────────────────────────────
 
 def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
-                      b_name, b_audience, b_tone, b_style, progress=gr.Progress()):
+                      b_name, b_audience, b_tone, b_style,
+                      pp_goal, pp_aud, pp_emo, pp_cta,
+                      progress=gr.Progress()):
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
+    pp = {"goal": pp_goal, "audience": pp_aud, "emotion": pp_emo, "cta": pp_cta}
+    extra = preproduction_prefix(pp)
     log_lines = []
 
     def log(msg):
@@ -190,47 +221,48 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         return "\n".join(log_lines)
 
     if audio is None:
-        return None, None, "[]", "", "Record or upload audio first."
+        return None, None, "[]", "", "Record or upload audio first.", ""
 
-    # 1. Transcribe
-    progress(0.05, desc="Transcribing audio…")
+    # Step 1: Transcribe
+    progress(0.05, desc="Step 1/5 · Transcribing audio…")
     with tempfile.TemporaryDirectory() as tmp:
         transcript = transcribe(Path(audio), language=None if lang == "auto" else lang,
                                 model_name=model, output_dir=Path(tmp))
-    status = log(f"✓ Transcribed ({len(transcript.split())} words)")
+    status = log(f"✓ Step 1/5 · Transcribed ({len(transcript.split())} words)")
 
-    # 2. Extract topics
-    progress(0.25, desc="Extracting topics…")
+    # Step 2: Extract topics
+    progress(0.25, desc="Step 2/5 · Extracting topics with Claude…")
     try:
-        topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang, brand=brand)
+        topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang,
+                                brand=brand, extra_context=extra)
     except Exception as e:
-        return None, transcript, "[]", "[]", log(f"✗ Extract topics failed: {e}")
+        return None, transcript, "[]", "[]", log(f"✗ Step 2/5 · Extract topics failed: {e}"), ""
     topics_json = json.dumps(topics, ensure_ascii=False, indent=2)
-    status = log(f"✓ Extracted {len(topics)} topics")
+    status = log(f"✓ Step 2/5 · Extracted {len(topics)} topics")
 
-    # 3. Write script (sections)
-    progress(0.45, desc="Writing script…")
+    # Step 3: Write script
+    progress(0.45, desc="Step 3/5 · Writing script with Claude…")
     try:
-        sections = write_script_sections(topics, lang=lang, style=style, brand=brand)
+        sections = write_script_sections(topics, lang=lang, style=style,
+                                         brand=brand, extra_context=extra)
     except Exception as e:
-        return None, transcript, topics_json, "[]", log(f"✗ Write script failed: {e}")
+        return None, transcript, topics_json, "[]", log(f"✗ Step 3/5 · Write script failed: {e}"), ""
     full_script = "\n\n".join(sections)
-    sections_json = json.dumps(sections, ensure_ascii=False, indent=2)
-    status = log(f"✓ Script written ({len(sections)} sections)")
+    status = log(f"✓ Step 3/5 · Script written ({len(sections)} sections)")
 
-    # 4. Generate TTS
-    progress(0.60, desc="Generating speech…")
+    # Step 4: Generate TTS
+    progress(0.60, desc="Step 4/5 · Generating Kokoro TTS (local, free)…")
     audio_out = Path(tempfile.mktemp(suffix=".wav"))
     durations_out = Path(tempfile.mktemp(suffix=".txt"))
     try:
         durations = generate_sections(sections, audio_out, lang=lang, voice=voice)
         durations_out.write_text("\n".join(f"{d:.3f}" for d in durations), "utf-8")
-        status = log(f"✓ TTS generated ({sum(durations):.1f}s total)")
+        status = log(f"✓ Step 4/5 · TTS generated ({sum(durations):.1f}s total)")
     except Exception as e:
-        return None, transcript, topics_json, full_script, log(f"✗ TTS failed: {e}")
+        return None, transcript, topics_json, full_script, log(f"✗ Step 4/5 · TTS failed: {e}"), ""
 
-    # 5. Assemble video
-    progress(0.80, desc="Assembling video…")
+    # Step 5: Assemble video
+    progress(0.80, desc="Step 5/5 · Assembling video with ffmpeg (local, free)…")
     with tempfile.TemporaryDirectory() as img_dir:
         img_dir_path = Path(img_dir)
 
@@ -241,7 +273,7 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
                 dst.write_bytes(src.read_bytes())
         else:
             _make_slide_images(topics, img_dir_path)
-            status = log("  (auto-generated title cards)")
+            status = log("  (auto-generated title cards from topic names)")
 
         video_out = Path(tempfile.mktemp(suffix=".mp4"))
         script = Path(__file__).parent / "make_video.sh"
@@ -252,32 +284,84 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
 
     ffmpeg_log = (result.stdout + result.stderr).strip()
     if not video_out.exists() or video_out.stat().st_size < 1000:
-        return None, transcript, topics_json, full_script, log(f"✗ Video failed:\n{ffmpeg_log}")
+        return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), ""
 
     progress(1.0, desc="Done!")
-    status = log(f"✓ Video ready ({video_out.stat().st_size // 1024} KB)")
-    return str(video_out), transcript, topics_json, full_script, status
+    status = log(f"✓ Step 5/5 · Video ready ({video_out.stat().st_size // 1024} KB)")
+
+    # Save session
+    session_path = save_session({
+        "saved_at": __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S"),
+        "transcript": transcript,
+        "topics_json": topics_json,
+        "full_script": full_script,
+        "sections_json": json.dumps(sections, ensure_ascii=False),
+        "lang": lang,
+        "style": style,
+        "brand": brand,
+        "preproduction": pp,
+    })
+    session_msg = f"Session saved: {session_path.name}"
+
+    return str(video_out), transcript, topics_json, full_script, status, session_msg
+
+
+# ── Tab 7: Session restore ────────────────────────────────────────────────────
+
+def run_resume_session():
+    state = load_latest_session()
+    if not state:
+        return "", "[]", "", gr.update(value="No saved sessions found.", visible=True)
+    return (
+        state.get("transcript", ""),
+        state.get("topics_json", "[]"),
+        state.get("full_script", ""),
+        gr.update(value=f"Resumed: {state.get('saved_at', 'unknown')}", visible=True),
+    )
+
+
+# ── Tab 8: Pre-production ─────────────────────────────────────────────────────
+
+def run_load_preproduction():
+    pp = load_preproduction()
+    return pp["goal"], pp["audience"], pp["emotion"], pp["cta"], "Loaded."
+
+def run_save_preproduction(goal, audience, emotion, cta):
+    save_preproduction({"goal": goal, "audience": audience, "emotion": emotion, "cta": cta})
+    return "Saved to preproduction.json."
+
+def run_preview_preproduction(goal, audience, emotion, cta):
+    pp = {"goal": goal, "audience": audience, "emotion": emotion, "cta": cta}
+    prefix = preproduction_prefix(pp)
+    return prefix if prefix else "(no pre-production context set — fields are empty)"
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 
-_b = load_brand()
+_b  = load_brand()
+_pp = load_preproduction()
 
 with gr.Blocks(title="idea-to-video") as demo:
-    gr.Markdown("# idea-to-video\n`Record → Transcribe → Topics → Script → TTS → Video`")
+    gr.Markdown("# idea-to-video\n`Talk → Transcribe → Topics → Script → TTS → Video`")
 
-    # Shared brand state (hidden, loaded once, synced from Brand tab)
+    # Shared brand state (hidden, loaded once, synced from Tab 0)
     b_name  = gr.State(_b["name"])
     b_aud   = gr.State(_b["audience"])
     b_tone  = gr.State(_b["tone"])
     b_style = gr.State(_b["style_notes"])
+
+    # Shared pre-production state (hidden, loaded once, synced from Tab 8)
+    pp_goal = gr.State(_pp["goal"])
+    pp_aud  = gr.State(_pp["audience"])
+    pp_emo  = gr.State(_pp["emotion"])
+    pp_cta  = gr.State(_pp["cta"])
 
     with gr.Tabs() as tabs:
 
         # ── Tab 0: Brand ──
         with gr.Tab("0 · Brand", id=0):
             gr.Markdown(
-                "Set your brand context once. Every Claude call reads it automatically.\n\n"
+                "Set your brand context once — loaded automatically into every Claude call.\n\n"
                 "**Highest-leverage change:** this prefix shapes every generated script and topic."
             )
             with gr.Row():
@@ -312,7 +396,7 @@ with gr.Blocks(title="idea-to-video") as demo:
 
         # ── Tab 2: Extract Topics ──
         with gr.Tab("2 · Extract Topics", id=2):
-            gr.Markdown("Transcript → key topics + image prompts via Claude.")
+            gr.Markdown("Transcript → key topics + image prompts via Claude. Pre-production and brand context applied automatically.")
             e_transcript = gr.Textbox(label="Transcript", lines=5, placeholder="Paste transcript or auto-fill from Tab 1…")
             with gr.Row():
                 e_num  = gr.Slider(1, 10, value=5, step=1, label="Number of topics")
@@ -332,6 +416,9 @@ with gr.Blocks(title="idea-to-video") as demo:
             w_run      = gr.Button("Write Script", variant="primary")
             w_out      = gr.Textbox(label="Full Script", lines=10)
             w_sections = gr.Textbox(label="Sections JSON", lines=4, visible=False)
+            with gr.Accordion("Storyboard preview", open=False):
+                gr.Markdown("*Card-per-slide view — verify structure before committing to TTS.*")
+                w_storyboard = gr.HTML(value="<p style='color:#888'>Run Write Script to preview storyboard.</p>")
             w_send     = gr.Button("→ Kokoro TTS")
 
         # ── Tab 4: Kokoro TTS ──
@@ -377,43 +464,102 @@ with gr.Blocks(title="idea-to-video") as demo:
         # ── Tab 7: Run Full Pipeline ──
         with gr.Tab("7 · Run Full Pipeline", id=7):
             gr.Markdown(
-                "**End-to-end:** record → transcribe → topics → script → TTS → video.\n\n"
-                "Brand context from Tab 0 is applied automatically.\n"
-                "Leave images empty to use auto-generated title cards."
+                "## Talk about your idea → get a video\n\n"
+                "Record yourself speaking — no script needed. The pipeline transcribes, "
+                "extracts structure, writes a TTS script, generates speech, and assembles the video.\n\n"
+                "**Brand context** (Tab 0) and **pre-production intent** (Tab 8 or accordion below) "
+                "are applied automatically to every Claude call."
             )
             with gr.Row():
-                p_audio  = gr.Audio(label="Audio", sources=["microphone", "upload"], type="filepath")
-                p_images = gr.File(label="Images (optional)", file_count="multiple", file_types=["image"])
+                p_audio  = gr.Audio(label="🎙 Record your idea (or upload)", sources=["microphone", "upload"], type="filepath")
+                p_images = gr.File(label="Slide images (optional — auto-generated if empty)", file_count="multiple", file_types=["image"])
             with gr.Row():
                 p_lang   = gr.Dropdown(["auto", "en", "zh"], value="auto", label="Language")
                 p_model  = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="base", label="Whisper model")
                 p_topics = gr.Slider(1, 10, value=5, step=1, label="Topics")
                 p_style  = gr.Dropdown(STYLES, value="conversational", label="Style")
                 p_voice  = gr.Dropdown(KOKORO_VOICES["en"], value="af_heart", label="TTS voice")
-            p_run    = gr.Button("Run Full Pipeline", variant="primary", size="lg")
+
+            with gr.Accordion("Pre-production context (optional — sets video intent)", open=False):
+                gr.Markdown(
+                    "*Fill these to shape narrative structure and pacing. "
+                    "Saved permanently in Tab 8.*"
+                )
+                with gr.Row():
+                    pp7_goal = gr.Textbox(label="Video goal", placeholder="e.g. Drive newsletter signups among indie hackers")
+                    pp7_aud  = gr.Textbox(label="Audience", placeholder="e.g. indie hackers, 25–40, building solo")
+                with gr.Row():
+                    pp7_emo  = gr.Textbox(label="Desired emotion", placeholder="e.g. inspired and slightly uncomfortable")
+                    pp7_cta  = gr.Textbox(label="CTA", placeholder="e.g. Subscribe at the link below")
+
+            p_run    = gr.Button("▶ Run Full Pipeline", variant="primary", size="lg")
+            gr.Markdown(
+                "_Free to iterate: Whisper transcription, Kokoro TTS, and ffmpeg video assembly "
+                "all run locally. Only the 3 Claude API calls cost money — approximately $0.01 per run._"
+            )
             p_video  = gr.Video(label="Output video")
             with gr.Accordion("Intermediate outputs", open=False):
                 p_transcript = gr.Textbox(label="Transcript", lines=4, interactive=False)
                 p_topics_out = gr.Textbox(label="Topics JSON", lines=6, interactive=False)
                 p_script_out = gr.Textbox(label="Script", lines=8, interactive=False)
-            p_status = gr.Textbox(label="Progress log", lines=6, interactive=False)
+            p_status      = gr.Textbox(label="Progress log", lines=6, interactive=False)
+            p_session_info = gr.Textbox(label="Session", interactive=False, visible=False)
+            resume_btn    = gr.Button("↩ Resume last session")
+
+        # ── Tab 8: Pre-production ──
+        with gr.Tab("8 · Pre-production", id=8):
+            gr.Markdown(
+                "Set the **intent** for this video. These 4 answers get prepended before brand context "
+                "in every Claude call — shaping narrative structure, pacing, and call-to-action.\n\n"
+                "**Use this for per-video goals.** Brand context (Tab 0) is for persistent identity."
+            )
+            with gr.Row():
+                pp_goal_inp = gr.Textbox(label="Video goal", value=_pp["goal"],
+                                         placeholder="e.g. Drive newsletter signups")
+                pp_aud_inp  = gr.Textbox(label="Target audience", value=_pp["audience"],
+                                         placeholder="e.g. indie hackers, 25–40, building solo")
+            with gr.Row():
+                pp_emo_inp  = gr.Textbox(label="Desired emotion at end", value=_pp["emotion"],
+                                         placeholder="e.g. inspired and slightly uncomfortable")
+                pp_cta_inp  = gr.Textbox(label="Call to action", value=_pp["cta"],
+                                         placeholder="e.g. Subscribe at the link below")
+            with gr.Row():
+                pp_load    = gr.Button("Load from preproduction.json")
+                pp_save    = gr.Button("Save to preproduction.json", variant="primary")
+                pp_preview = gr.Button("Preview prompt prefix")
+            pp_status      = gr.Textbox(label="Status", interactive=False)
+            pp_preview_out = gr.Textbox(label="Prompt prefix preview (sent to Claude)", lines=8, interactive=False)
+
+            pp_load.click(run_load_preproduction,
+                          outputs=[pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp, pp_status])
+            pp_save.click(run_save_preproduction,
+                          [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp], pp_status)
+            pp_save.click(lambda g, a, e, c: (g, a, e, c),
+                          [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp],
+                          [pp_goal, pp_aud, pp_emo, pp_cta])
+            pp_preview.click(run_preview_preproduction,
+                             [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp], pp_preview_out)
 
     # ── Wire pipeline ─────────────────────────────────────────────────────────
 
-    # Tab 1 → Tab 2  (copy transcript + navigate)
+    # Tab 1 → Tab 2
     t_run.click(run_transcribe, [t_audio, t_lang, t_model], t_out)
     t_send.click(lambda t: (t, gr.update(selected=2)), t_out, [e_transcript, tabs])
 
-    # Tab 2 → Tab 3  (copy topics JSON + navigate)
+    # Tab 2 → Tab 3
     e_run.click(run_extract_topics,
-                [e_transcript, e_num, e_lang, b_name, b_aud, b_tone, b_style],
+                [e_transcript, e_num, e_lang,
+                 b_name, b_aud, b_tone, b_style,
+                 pp_goal, pp_aud, pp_emo, pp_cta],
                 [e_display, e_json])
     e_send.click(lambda j: (j, gr.update(selected=3)), e_json, [w_topics, tabs])
 
-    # Tab 3 → Tab 4  (copy script + sections + navigate)
+    # Tab 3 → Tab 4
     w_run.click(run_write_script,
-                [w_topics, w_lang, w_style, b_name, b_aud, b_tone, b_style],
-                [w_out, w_sections])
+                [w_topics, w_lang, w_style,
+                 b_name, b_aud, b_tone, b_style,
+                 pp_goal, pp_aud, pp_emo, pp_cta],
+                [w_out, w_sections, w_storyboard])
     w_run.click(lambda s: s, w_out, k_text)
     w_run.click(lambda s: s, w_sections, k_sections)
     w_send.click(
@@ -433,13 +579,20 @@ with gr.Blocks(title="idea-to-video") as demo:
     # Tab 6
     v_run.click(run_make_video, [v_audio, v_durations, v_images, v_topics], [v_video, v_log])
 
-    # Tab 7 — full pipeline
+    # Tab 7 — full pipeline (pp7_* inline fields override shared State pp_*)
     p_run.click(
         run_full_pipeline,
         [p_audio, p_lang, p_model, p_topics, p_style, p_voice, p_images,
-         b_name, b_aud, b_tone, b_style],
-        [p_video, p_transcript, p_topics_out, p_script_out, p_status],
+         b_name, b_aud, b_tone, b_style,
+         pp7_goal, pp7_aud, pp7_emo, pp7_cta],
+        [p_video, p_transcript, p_topics_out, p_script_out, p_status, p_session_info],
     )
+    p_run.click(lambda _: gr.update(visible=False), p_status, p_session_info)  # hide before run
+    p_session_info.change(lambda v: gr.update(visible=bool(v)), p_session_info, p_session_info)
+
+    # Resume last session
+    resume_btn.click(run_resume_session, [],
+                     [p_transcript, p_topics_out, p_script_out, p_session_info])
 
 
 if __name__ == "__main__":

@@ -16,10 +16,11 @@ def write_script(
     lang: str = "en",
     style: str = "conversational",
     brand: dict | None = None,
+    extra_context: str = "",
 ) -> str:
     """Write a TTS-ready spoken script from a list of topic dicts. Returns full script."""
     client = Anthropic()
-    ctx = brand_prefix(brand)
+    ctx = (extra_context.strip() + "\n\n" if extra_context.strip() else "") + brand_prefix(brand)
     lang_note = "Write the script in Chinese." if lang == "zh" else "Write the script in English."
     topics_text = "\n".join(f"- {t['title']}: {t['summary']}" for t in topics)
 
@@ -50,13 +51,15 @@ def write_script_sections(
     lang: str = "en",
     style: str = "conversational",
     brand: dict | None = None,
+    extra_context: str = "",
 ) -> list[str]:
     """Write a TTS script split into one section per topic.
 
     Returns a list of strings (one per topic), suitable for per-slide audio generation.
+    extra_context is prepended before brand_prefix in the prompt.
     """
     client = Anthropic()
-    ctx = brand_prefix(brand)
+    ctx = (extra_context.strip() + "\n\n" if extra_context.strip() else "") + brand_prefix(brand)
     lang_note = "Write the script in Chinese." if lang == "zh" else "Write the script in English."
     topics_text = "\n".join(f"- {t['title']}: {t['summary']}" for t in topics)
     n = len(topics)

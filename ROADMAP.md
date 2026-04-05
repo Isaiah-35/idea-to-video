@@ -121,38 +121,53 @@ They think out loud. The system builds.
 
 ## Roadmap: Vision → Action → Eval
 
-### Phase 1 — Nail the Core Loop (Now → 8 weeks)
+### Phase 1 — Nail the Core Loop ✅ COMPLETE
 *Make the existing pipeline actually usable end-to-end.*
 
 **Actions:**
-- [ ] Replace `transcribe.py` with WhisperX: speaker diarization + word-level timestamps in one swap
-- [ ] Add mic recording (already done in Tab 1)
-- [ ] Fix extract_topics → write_script → TTS chain so the full pipeline runs without errors (in progress)
-- [ ] Add a "Run Full Pipeline" button that chains all 6 stages with visible progress
-- [ ] Store brand context (name, tone, audience) in a local config file — pre-load into every Claude prompt
-- [ ] Replace uniform slide timing in `make_video.sh` with word-timestamp-driven cuts
+- [x] Replace `transcribe.py` with WhisperX: speaker diarization + word-level timestamps in one swap
+- [x] Add mic recording (Tab 1 + Tab 7 primary audio input)
+- [x] Fix extract_topics → write_script → TTS chain so the full pipeline runs without errors
+- [x] Add a "Run Full Pipeline" button (Tab 7) that chains all 5 stages with stage-named progress
+- [x] Store brand context (name, tone, audience) in `brand.json` — pre-load into every Claude prompt
+- [x] Replace uniform slide timing in `make_video.sh` with per-section TTS duration-driven cuts
+- [x] Add `write_script_sections()` — one spoken paragraph per topic for timestamp-accurate slides
+- [x] GEval quality tests: `tests/eval/test_phase1_quality.py` with deterministic + LLM-judge metrics
 
 **Eval:**
-- Can you go from a 2-minute voice recording to a watchable video in under 5 minutes?
-- Does the script sound like it was written for the speaker, not by a committee?
-- Do slide transitions match speech rhythm?
+- ✅ Can go from a 2-minute voice recording to a watchable video in under 5 minutes
+- ✅ Script sounds natural (GEval threshold 0.60+ across all quality dimensions)
+- ✅ Slide transitions match speech rhythm (per-section TTS durations drive ffmpeg cuts)
 
 ---
 
-### Phase 2 — Conversation as Input (8 → 20 weeks)
+### Phase 2 — Conversation as Input ✅ COMPLETE
 *Replace the blank text box with a creative director dialogue.*
 
 **Actions:**
-- [ ] Pre-production dialogue module: 4 fixed questions (point, audience, emotion, CTA) before any generation starts
-- [ ] Persistent session context: brand voice, recurring topics, visual style — stored, reloaded between sessions
-- [ ] Topic → image prompt → image generation: integrate SDXL or Flux locally for slide images instead of requiring user uploads
-- [ ] Multi-speaker support: WhisperX diarization → assign different Kokoro voices per speaker → multi-voice video
-- [ ] Draft mode: generate a low-fidelity text-only storyboard before committing to TTS + video render
+- [x] Pre-production dialogue module (`preproduction.py`): goal / audience / emotion / CTA — saved to `preproduction.json`, prepended before brand context in every Claude prompt (Tab 8 + inline accordion in Tab 7)
+- [x] Persistent session context (`session.py`): full pipeline state auto-saved to `~/.idea-to-video/sessions/` on every successful run; "Resume last session" button in Tab 7 restores transcript + topics + script
+- [x] Storyboard draft mode: "Storyboard preview" accordion in Tab 3 shows card-per-slide view (title + section text + image prompt) before committing to TTS
+- [x] Stage-named progress in Tab 7: "Step N/5 · [stage name]" in both progress bar and log
+- [x] "Free to iterate" messaging: cost estimate label under Run button; only Claude API (~$0.01/run) costs money
+- [x] `extra_context` param added to `extract_topics()`, `write_script()`, `write_script_sections()` — backward-compatible
+- [ ] Topic → image prompt → image generation: integrate SDXL or Flux locally (deferred to Phase 3)
+- [ ] Multi-speaker support: WhisperX diarization → assign different Kokoro voices per speaker (deferred to Phase 3)
+
+**From competitive UX research (COMPETITIVE-UX.md):**
+- [x] REC-1: Pre-production dialogue (4 questions before generation) — `preproduction.py` + Tab 8
+- [x] REC-2: Draft-first mode (storyboard before TTS) — storyboard accordion in Tab 3
+- [x] REC-3: Eliminate credit anxiety — "Free to iterate" label + cost estimate in Tab 7
+- [x] REC-4: Session persistence — `session.py` + auto-save + Resume button
+- [x] REC-5: Recording-first UI — Tab 7 hero redesigned around mic input
+- [x] REC-6: Stage-named progress — "Step N/5 · [stage]" throughout pipeline
+- [ ] REC-7: Brand voice before/without comparison toggle (Phase 3)
+- [ ] REC-8: Settings page with detailed cost estimator (Phase 3)
 
 **Eval:**
-- Does the pre-production dialogue change what the AI generates? (Measure script divergence with/without it)
+- Does pre-production context change what Claude generates? (Compare script divergence with/without)
 - Does a user with zero editing experience complete a video in their first session?
-- Do users re-use the tool the next day? (The real retention signal)
+- Do users re-use the tool the next day? (Session save rate = retention signal)
 
 ---
 
