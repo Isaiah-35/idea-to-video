@@ -109,7 +109,13 @@ def _make_dalle3_card(scene: dict) -> bytes:
     import urllib.request
 
     client = openai.OpenAI(api_key=api_key)
-    prompt = scene.get("image_prompt") or scene.get("title", "abstract visual")
+    raw_prompt = scene.get("image_prompt") or scene.get("title", "abstract visual")
+    # Enforce cinematic framing so the image works as a video slide
+    prompt = (
+        f"{raw_prompt}. "
+        "Cinematic wide shot, 16:9 landscape orientation, photorealistic, "
+        "high detail, no text, no watermarks, no logos."
+    )
     response = client.images.generate(
         model="dall-e-3",
         prompt=prompt,
