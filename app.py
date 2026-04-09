@@ -896,7 +896,7 @@ with gr.Blocks(title="idea-to-video") as demo:
                 "Scenes JSON is auto-filled from the last full pipeline run."
             )
             with gr.Row():
-                rp_video = gr.Video(label="Input video")
+                rp_video = gr.Video(label="Input video (auto-filled from Tab 6 or Tab 7)")
                 rp_scenes = gr.Textbox(label="Scenes JSON (auto-filled from Tab 7)", lines=6,
                                        placeholder='[{"title": "...", "duration_s": 12.3}, ...]')
             rp_max_dur = gr.Slider(15, 120, value=60, step=5, label="Max clip duration (seconds)")
@@ -971,8 +971,9 @@ with gr.Blocks(title="idea-to-video") as demo:
     # Tab 5
     s_run.click(run_speak, [s_text, s_rate, s_volume], [s_audio, s_info])
 
-    # Tab 6
+    # Tab 6 — video output auto-fills Tab 10 Repurpose
     v_run.click(run_make_video, [v_audio, v_durations, v_images, v_topics], [v_video, v_log])
+    v_run.click(lambda v: v, v_video, rp_video)
 
     # Tab 7 — full pipeline (pp7_* inline fields override shared State pp_*)
     p_run.click(
@@ -986,7 +987,8 @@ with gr.Blocks(title="idea-to-video") as demo:
     p_run.click(lambda _: gr.update(visible=False), p_status, p_session_info)
     p_session_info.change(lambda v: gr.update(visible=bool(v)), p_session_info, p_session_info)
 
-    # Auto-populate Tab 10 scenes from pipeline output
+    # Tab 7 pipeline video + scenes auto-fill Tab 10 Repurpose
+    p_run.click(lambda v: v, p_video, rp_video)
     p_scenes_json.change(lambda v: v if v and v != "[]" else gr.update(), p_scenes_json, rp_scenes)
 
     # Resume last session
