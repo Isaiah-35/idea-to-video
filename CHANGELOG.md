@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.0] — 2026-05-19
+
+### Features
+- **SenseVoice-Small backend** (`transcribe.py`): default ASR backend via FunASR.
+  Per-utterance language detection — handles Chinese/English code-switching that Whisper
+  mangles. ~15× realtime on CPU. Chained with `fsmn-vad` so long audio (>30s) processes
+  cleanly instead of being silently truncated to the first chunk.
+- **Mac Voice Memos picker** (`app.py:list_voice_memos`): Tab 1 dropdown lists recent
+  recordings from `CloudRecordings.db` (read-only URI mode). One click loads the `.m4a`
+  into the audio component — no more drag-and-drop fights with the Voice Memos UI.
+  `demo.launch(allowed_paths=…)` whitelists the recordings directory so Gradio doesn't
+  reject paths outside the project tree.
+- **Claude cleanup pass** (`transcribe.py:clean_transcript`): post-ASR Claude pass that
+  fixes residual mis-reads — English jargon misheard as Chinese homophones (`Cco` →
+  `Claude Code`), homophone errors, fragmented English. Default-on checkbox in Tab 1,
+  also runs inside `run_full_pipeline`. Preserves every semantic unit, never paraphrases.
+- **MLX backend selection** for word-timestamp and pyannote-diarization paths that
+  SenseVoice cannot serve (separate from the SenseVoice transcript path).
+
+### Fixes
+- `_claude_label` now swallows Anthropic API failures and returns the unlabeled
+  transcript instead of raising — workspace cap / network errors no longer crash Tab 1.
+- `clean_transcript` falls back to the raw transcript on API failure or suspiciously
+  short output (< 30% of input).
+- Pyannote `DiarizationPipeline` arg rename: try `token=` first, fall back to
+  `use_auth_token=` for older whisperx installs.
+- `print(f"[{backend}] Saved: ...")` now uses the actual backend used for the call,
+  not the global `_BACKEND` (relevant when SenseVoice falls through to MLX).
+
+### Deps
+- Added `funasr` to `requirements.txt`.
+
 ## [0.2.0] — 2026-04-05
 
 ### Features

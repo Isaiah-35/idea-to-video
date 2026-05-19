@@ -55,7 +55,7 @@ bash make_video.sh ./topic_folder/ audio.wav output.mp4
 
 | File | Role |
 |------|------|
-| `transcribe.py` | Whisper-based speech-to-text; auto-detects or targets `en`/`zh` |
+| `transcribe.py` | Multi-backend ASR. Default: SenseVoice-Small (FunASR) + fsmn-vad — per-utterance language detection for zh/en code-switching. Fall-through to MLX-Whisper / WhisperX / Whisper. `clean_transcript()` Claude pass fixes residual mis-reads. |
 | `kokoro_tts.py` | Kokoro neural TTS → 24kHz WAV; primary TTS engine |
 | `speak.py` | pyttsx3 fallback TTS; offline but lower quality |
 | `make_video.sh` | ffmpeg slideshow assembler; scales images to 1920×1080, adds fade transitions, encodes H.264/AAC |
@@ -63,7 +63,9 @@ bash make_video.sh ./topic_folder/ audio.wav output.mp4
 **Key behaviors:**
 - `make_video.sh` distributes audio duration evenly across images, applies 1s fade in/out per slide, validates output file size after encoding
 - Kokoro default voices: English → `af_heart`, Chinese → `zf_xiaobei`
-- Whisper runs fully locally (no cloud)
+- ASR runs fully locally (no cloud). Default backend SenseVoice downloads ~1GB to `~/.cache/modelscope/` on first use.
+- Tab 1 has a Mac Voice Memos picker that reads `CloudRecordings.db` (read-only URI mode) — no drag-and-drop required.
+- All Claude-driven steps (cleanup, speaker labeling, topics, script) degrade gracefully on API failure; transcribe still returns text even when Claude is unreachable.
 
 ## Language Support
 

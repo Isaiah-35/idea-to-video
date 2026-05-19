@@ -33,17 +33,44 @@ Or run each stage from the CLI — see [Pipeline CLI](#pipeline-cli) below.
 
 ### Conversation-First Transcription
 
-You talk. The pipeline listens.
+You talk. The pipeline listens — even when you switch languages mid-sentence.
 
-Upload a WAV recording of yourself explaining an idea — an interview, a voice memo, a rambling
-braindump — and get back a clean, timestamped transcript. No script required up front.
+Record yourself in Voice Memos, pick the file from the in-app dropdown, click Transcribe.
+Get back a clean transcript that handles 80/20 Chinese-English code-switching without
+mangling the English insertions. No drag-and-drop, no audio prep, no language flag — pick
+`auto` and the right model does the right thing.
 
 <details>
 <summary>Technical innovation</summary>
 
-Dual-engine transcription: tries **WhisperX** first for word-level timestamps and speaker
-diarization (assigns each word to a speaker using pyannote.audio), falls back to vanilla
-**Whisper** if WhisperX isn't installed. Both run fully locally — no cloud API call.
+**Four-backend ASR chain** auto-selects the best available:
+
+1. **SenseVoice-Small** (default) — FunASR's multilingual model. Detects language *per
+   utterance*, so short English words inside Chinese audio transcribe correctly. Whisper
+   locks one language per 30-second window and mangles code-switching; SenseVoice does
+   not. Runs at ~15× realtime on CPU.
+2. **MLX-Whisper** — Apple Silicon GPU + Neural Engine via `mlx-whisper`, used when word
+   timestamps or pyannote diarization are requested (paths SenseVoice can't serve).
+3. **WhisperX** — CTranslate2 int8, all CPU cores, for older installs.
+4. **Vanilla Whisper** — CPU fallback of last resort.
+
+**VAD chaining** is required for long audio: SenseVoice alone only processes one ~30s
+window. `fsmn-vad` splits the input into utterance-sized chunks first, then SenseVoice
+transcribes each. A 19-minute file takes ~80s wall time (≈15× realtime).
+
+**Claude cleanup pass** (default on, toggleable per-call) fixes residual ASR mis-reads —
+English technical jargon misheard as Chinese homophones (`Cco` → `Claude Code`, `colre` →
+`code`), Chinese phrases corrupted by adjacent English. Preserves every semantic unit,
+never paraphrases. Falls back to raw transcript on API failure.
+
+**Mac Voice Memos picker** reads your iCloud-synced `CloudRecordings.db` directly to
+populate a dropdown of recent recordings — no drag-and-drop. One click loads the `.m4a`
+into the audio component; the SenseVoice backend handles `.m4a` natively via ffmpeg.
+
+**Speaker labeling** uses pyannote diarization when `HF_TOKEN` is set (requires accepting
+the gated model terms at huggingface.co/pyannote/speaker-diarization-community-1), with
+a Claude inference fallback. Both paths degrade gracefully on failure — the transcribe
+call returns unlabeled text rather than crashing.
 
 </details>
 
@@ -51,10 +78,15 @@ diarization (assigns each word to a speaker using pyannote.audio), falls back to
 <summary>Implementation</summary>
 
 - Module: [`transcribe.py`](transcribe.py)
-- Public API: `transcribe(audio_path, lang, model)`, `transcribe_with_timestamps(...)`
-- Internal: `_transcribe_whisperx()`, `_transcribe_whisper()`
-- Whisper model sizes: `tiny` → `large` (trade speed for accuracy)
-- WhisperX install: `pip install whisperx` — requires HuggingFace token for pyannote
+- Public API: `transcribe(audio_path, language, model_name, output_dir, speaker_names, speaker_hints)`,
+  `transcribe_with_timestamps(...)`, `clean_transcript(text, lang, model)`
+- Backends: `_transcribe_sensevoice()`, `_transcribe_mlx()`, `_transcribe_whisperx()`, `_transcribe_whisper()`
+- Voice Memos picker: `list_voice_memos()` in [`app.py`](app.py); reads
+  `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db`
+  in read-only URI mode so the live Voice Memos process is never locked.
+- Override default backend: `SENSEVOICE_DISABLE=1` skips SenseVoice and falls through to MLX.
+- Gradio allow-list: `demo.launch(allowed_paths=[VOICE_MEMOS_DIR])` so the picker can hand
+  paths outside the project tree to `gr.Audio`.
 - Research notes: [`RESEARCH_TRANSCRIPTION.md`](RESEARCH_TRANSCRIPTION.md)
 
 ```bash
@@ -495,8 +527,13 @@ brew install ffmpeg
 
 ```bash
 pip install whisperx
-# Requires HuggingFace token for pyannote diarization model
+# For pyannote speaker diarization: set HF_TOKEN env var AND accept terms at
+# https://huggingface.co/pyannote/speaker-diarization-community-1 (gated model).
+# Without both, transcribe falls back to Claude inference for speaker labels.
 ```
+
+**Default ASR backend — SenseVoice** ships in `requirements.txt` (`funasr`). The
+SenseVoice-Small model (~1GB) downloads on first use to `~/.cache/modelscope/`.
 
 ---
 

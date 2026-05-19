@@ -2,9 +2,11 @@
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import gradio as gr
@@ -12,7 +14,7 @@ import gradio as gr
 from brand import load_brand, save_brand, brand_prefix
 from preproduction import load_preproduction, save_preproduction, preproduction_prefix
 from session import save_session, load_latest_session, build_scene_graph
-from transcribe import transcribe
+from transcribe import transcribe, clean_transcript
 from extract_topics import extract_topics
 from write_script import write_script, write_script_sections, STYLES
 from kokoro_tts import generate, generate_sections
@@ -112,9 +114,75 @@ def run_preview_brand(name, audience, tone, style_notes):
     return prefix if prefix else "(no brand context set — fields are empty)"
 
 
+# ── Voice Memos picker ────────────────────────────────────────────────────────
+
+VOICE_MEMOS_DIR = (
+    Path.home()
+    / "Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings"
+)
+# Core Data epoch is 2001-01-01 UTC; rows store seconds since then.
+_CORE_DATA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+def list_voice_memos(limit: int = 50) -> list[tuple[str, str]]:
+    """Return [(label, path), ...] of recent Voice Memos, newest first.
+
+    Label is "Mon D, h:MM AM — Title (Xm SSs)". Title falls back to the
+    filename stem when ZCUSTOMLABEL is empty.
+    """
+    if not VOICE_MEMOS_DIR.is_dir():
+        return []
+
+    db = VOICE_MEMOS_DIR / "CloudRecordings.db"
+    rows: list[tuple[str, str]] = []
+
+    if db.exists():
+        try:
+            # Read-only URI so we never lock the live DB.
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            cur = con.execute(
+                "SELECT ZCUSTOMLABEL, ZPATH, ZDATE, ZDURATION "
+                "FROM ZCLOUDRECORDING WHERE ZPATH IS NOT NULL "
+                "ORDER BY ZDATE DESC LIMIT ?",
+                (limit,),
+            )
+            for label, path, zdate, dur in cur:
+                full = VOICE_MEMOS_DIR / (path or "")
+                if not full.exists():
+                    continue
+                local = (_CORE_DATA_EPOCH
+                         + timedelta(seconds=float(zdate or 0))).astimezone()
+                date_str = local.strftime("%b %-d, %-I:%M %p")
+                secs = int(dur or 0)
+                dur_str = f"{secs // 60}m{secs % 60:02d}s"
+                title = (label or "").strip() or full.stem
+                rows.append((f"{date_str} — {title} ({dur_str})", str(full)))
+            con.close()
+        except sqlite3.Error:
+            rows = []
+
+    if not rows:
+        # Fallback: filesystem listing if DB read failed.
+        for p in sorted(VOICE_MEMOS_DIR.glob("*.m4a"),
+                        key=lambda x: x.stat().st_mtime, reverse=True)[:limit]:
+            rows.append((p.stem, str(p)))
+
+    return rows
+
+
+def refresh_voice_memos():
+    """Rebuild the picker choices and clear the current selection."""
+    return gr.update(choices=list_voice_memos(), value=None)
+
+
+def load_voice_memo(path: str | None):
+    """Selecting a memo updates the audio component with its file path."""
+    return path or None
+
+
 # ── Tab 1: Transcribe ─────────────────────────────────────────────────────────
 
-def run_transcribe(audio_path, lang, model, speaker_a, speaker_b, hints):
+def run_transcribe(audio_path, lang, model, speaker_a, speaker_b, hints, claude_cleanup):
     if audio_path is None:
         return "Record or upload an audio file first."
     language = None if lang == "auto" else lang
@@ -131,6 +199,8 @@ def run_transcribe(audio_path, lang, model, speaker_a, speaker_b, hints):
             speaker_names=speaker_names,
             speaker_hints=hints or "",
         )
+    if claude_cleanup:
+        text = clean_transcript(text, lang=language, model=claude_model)
     return text
 
 
@@ -377,6 +447,11 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
     with tempfile.TemporaryDirectory() as tmp:
         transcript = transcribe(Path(audio), language=None if lang == "auto" else lang,
                                 model_name=model, output_dir=Path(tmp))
+    # Claude cleanup of ASR mis-reads (English jargon mis-heard as Chinese,
+    # homophones). Falls back to raw transcript on any error.
+    transcript = clean_transcript(transcript,
+                                  lang=None if lang == "auto" else lang,
+                                  model=claude_model)
     status = log(f"✓ Step 1/5 · Transcribed ({len(transcript.split())} words)")
 
     # Step 2: Extract topics
@@ -644,15 +719,32 @@ with gr.Blocks(title="idea-to-video") as demo:
         # ── Tab 1: Transcribe ──
         with gr.Tab("1 · Transcribe", id=1):
             gr.Markdown(
-                "Upload or record audio → labeled transcript in one step.\n\n"
+                "Upload, record, or pick from Voice Memos → labeled transcript in one step.\n\n"
+                "**Code-switched audio (e.g. 80% Chinese + 20% English):** keep "
+                "language on `auto`. The default backend is SenseVoice-Small, which "
+                "detects language per utterance — Whisper locks one language per "
+                "30s window, so it mangles short English insertions in Chinese audio.\n\n"
                 "**For conversations:** fill in speaker names before clicking Transcribe. "
-                "WhisperX diarization is used when `HF_TOKEN` is set; otherwise Claude "
-                "infers turns from conversational patterns. Leave names blank for solo recordings."
+                "WhisperX diarization is used when `HF_TOKEN` is set (auto falls back "
+                "from SenseVoice to MLX-Whisper for the diarization path); otherwise "
+                "Claude infers turns. Leave names blank for solo recordings."
             )
+            with gr.Row():
+                t_vm_picker = gr.Dropdown(
+                    choices=list_voice_memos(),
+                    label="📱 Pick from Mac Voice Memos (newest first)",
+                    value=None, scale=5,
+                )
+                t_vm_refresh = gr.Button("🔄 Refresh", scale=1)
             t_audio = gr.Audio(label="Audio", sources=["microphone", "upload"], type="filepath")
             with gr.Row():
                 t_lang  = gr.Dropdown(["auto", "en", "zh"], value="auto", label="Language")
-                t_model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="base", label="Whisper model")
+                t_model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="base", label="Whisper model (fallback only)")
+                t_cleanup = gr.Checkbox(
+                    value=True,
+                    label="Clean with Claude",
+                    info="Fixes ASR mis-reads of English jargon in zh/en code-switched audio. +~10s, ~$0.02 per transcript.",
+                )
             with gr.Row():
                 t_speaker_a = gr.Textbox(label="Speaker A name", placeholder="e.g. Paul (leave blank for solo)", scale=1)
                 t_speaker_b = gr.Textbox(label="Speaker B name", placeholder="e.g. Sam (leave blank for solo)", scale=1)
@@ -909,8 +1001,10 @@ with gr.Blocks(title="idea-to-video") as demo:
     # ── Wire pipeline ─────────────────────────────────────────────────────────
 
     # Tab 1 → Tab 2
-    t_run.click(run_transcribe, [t_audio, t_lang, t_model, t_speaker_a, t_speaker_b, t_hints], t_out)
+    t_run.click(run_transcribe, [t_audio, t_lang, t_model, t_speaker_a, t_speaker_b, t_hints, t_cleanup], t_out)
     t_send.click(lambda t: (t, gr.update(selected=2)), t_out, [e_transcript, tabs])
+    t_vm_picker.change(load_voice_memo, t_vm_picker, t_audio)
+    t_vm_refresh.click(refresh_voice_memos, None, t_vm_picker)
 
     # Tab 2 → Tab 3
     e_run.click(run_extract_topics,
@@ -1003,4 +1097,7 @@ with gr.Blocks(title="idea-to-video") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch()
+    # Whitelist the Mac Voice Memos directory so the picker can hand its
+    # .m4a paths to gr.Audio without tripping Gradio's _check_allowed guard.
+    allowed = [str(VOICE_MEMOS_DIR)] if VOICE_MEMOS_DIR.is_dir() else []
+    demo.launch(allowed_paths=allowed)

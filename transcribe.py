@@ -1,20 +1,32 @@
 """Transcribe WAV audio with optional speaker labeling.
 
 Backend priority (auto-selected at import time):
-  1. mlx      — Apple Silicon GPU + Neural Engine via mlx-whisper
-                 ~10x faster than CPU on M-series; pip install mlx-whisper
-  2. whisperx — CTranslate2 int8, all CPU cores; pyannote diarization on MPS
-  3. whisper  — OpenAI reference implementation, CPU fallback
+  1. sensevoice — FunASR SenseVoice-Small; best zh/en code-switching;
+                  ~15× faster than Whisper-large. pip install funasr
+  2. mlx        — Apple Silicon GPU + Neural Engine via mlx-whisper
+                  ~10x faster than CPU on M-series; pip install mlx-whisper
+  3. whisperx   — CTranslate2 int8, all CPU cores; pyannote diarization on MPS
+  4. whisper    — OpenAI reference implementation, CPU fallback
+
+Code-switching note:
+  - SenseVoice is used by default because it handles per-utterance language
+    detection — critical for zh/en mixed audio (e.g. 80% Chinese + 20% English
+    code-switching). Whisper-family backends lock language per 30s window.
+  - To force a Whisper backend, set env var SENSEVOICE_DISABLE=1.
 
 Speaker labeling:
   - WhisperX/MLX + pyannote diarization when HF_TOKEN is set (audio-level, accurate)
   - Claude inference fallback when HF_TOKEN is absent (pattern-based, no extra install)
+  - SenseVoice has no diarization; falls through to MLX/WhisperX when both
+    speaker_names and HF_TOKEN are set, otherwise uses Claude inference.
 
 Performance notes:
   - Models cached at module level — loaded once per process, instant on reuse.
   - Word alignment skipped by default (need_word_timestamps=False).
     Alignment runs at ~1× realtime on CPU; skipping it is the single biggest
     speedup for transcript-only use (tab 1 → topics → script flow).
+  - SenseVoice has no word-timestamp output; when need_word_timestamps=True
+    the call falls through to MLX/WhisperX automatically.
   - CTranslate2 uses cpu_threads=0 (all cores); M3 Max = 14 threads.
   - Diarization runs on MPS (Apple Silicon GPU) when available.
 """
@@ -29,16 +41,35 @@ from pathlib import Path
 
 _mlx_whisper = None  # type: ignore
 _whisperx = None     # type: ignore
+_funasr = None       # type: ignore
+
+# Try imports independently so the chain can fall through for paths SenseVoice
+# can't serve (e.g. word timestamps, HF_TOKEN diarization).
+if not os.environ.get("SENSEVOICE_DISABLE"):
+    try:
+        import funasr as _funasr  # type: ignore
+    except ImportError:
+        _funasr = None
 
 try:
     import mlx_whisper as _mlx_whisper
-    _BACKEND = "mlx"
 except ImportError:
-    try:
-        import whisperx as _whisperx
-        _BACKEND = "whisperx"
-    except ImportError:
-        _BACKEND = "whisper"
+    _mlx_whisper = None
+
+try:
+    import whisperx as _whisperx
+except ImportError:
+    _whisperx = None
+
+# Pick the default backend.
+if _funasr is not None:
+    _BACKEND = "sensevoice"
+elif _mlx_whisper is not None:
+    _BACKEND = "mlx"
+elif _whisperx is not None:
+    _BACKEND = "whisperx"
+else:
+    _BACKEND = "whisper"
 
 # Expose under canonical names for patching in tests
 whisperx = _whisperx  # type: ignore
@@ -81,9 +112,31 @@ _MLX_MODELS = {
 
 # ── Model cache (module-level — persists across Gradio calls) ─────────────────
 
-_asr_cache:     dict = {}   # (model_name,) → whisperx model
-_align_cache:   dict = {}   # lang → (align_model, metadata)
-_diarize_cache: dict = {}   # hf_token[:8] → DiarizationPipeline
+_asr_cache:        dict = {}   # (model_name,) → whisperx model
+_align_cache:      dict = {}   # lang → (align_model, metadata)
+_diarize_cache:    dict = {}   # hf_token[:8] → DiarizationPipeline
+_sensevoice_cache: dict = {}   # "default" → funasr.AutoModel
+
+
+def _load_sensevoice_model():
+    if "default" not in _sensevoice_cache:
+        from funasr import AutoModel
+        # SenseVoice-Small: 234M params, supports zh/en/yue/ja/ko + auto.
+        # MPS support is experimental in funasr; CPU is the stable choice.
+        #
+        # VAD chaining is REQUIRED for audio >30s — SenseVoice alone processes
+        # only one window and silently drops the tail. fsmn-vad (~50MB) splits
+        # the input into utterance-sized chunks first; the SenseVoice pass then
+        # transcribes each. max_single_segment_time is in milliseconds.
+        _sensevoice_cache["default"] = AutoModel(
+            model="iic/SenseVoiceSmall",
+            vad_model="fsmn-vad",
+            vad_kwargs={"max_single_segment_time": 30000},
+            trust_remote_code=False,
+            disable_update=True,
+            device="cpu",
+        )
+    return _sensevoice_cache["default"]
 
 
 def _load_whisperx_model(model_name: str):
@@ -109,9 +162,16 @@ def _load_diarize_pipeline(hf_token: str):
     key = hf_token[:8]
     if key not in _diarize_cache:
         from whisperx.diarize import DiarizationPipeline
-        _diarize_cache[key] = DiarizationPipeline(
-            use_auth_token=hf_token, device=_TORCH_DEV
-        )
+        # whisperx upgraded pyannote; the constructor arg was renamed
+        # use_auth_token → token. Try new first, fall back for older installs.
+        try:
+            _diarize_cache[key] = DiarizationPipeline(
+                token=hf_token, device=_TORCH_DEV
+            )
+        except TypeError:
+            _diarize_cache[key] = DiarizationPipeline(
+                use_auth_token=hf_token, device=_TORCH_DEV
+            )
     return _diarize_cache[key]
 
 
@@ -143,13 +203,27 @@ def transcribe(
     Returns:
         Transcript string. Speaker-labeled if speaker_names provided.
     """
-    if _BACKEND == "mlx":
+    backend = _BACKEND
+    # SenseVoice can't produce word timestamps and lacks built-in diarization.
+    # Fall through to a Whisper backend for those paths.
+    needs_fallthrough = need_word_timestamps or (
+        speaker_names and os.environ.get("HF_TOKEN")
+    )
+    if backend == "sensevoice" and needs_fallthrough:
+        backend = "mlx" if _mlx_whisper else ("whisperx" if _whisperx else "whisper")
+
+    if backend == "sensevoice":
+        text, segments = _transcribe_sensevoice(
+            file_path, language=language,
+            speaker_names=speaker_names, speaker_hints=speaker_hints,
+        )
+    elif backend == "mlx":
         text, segments = _transcribe_mlx(
             file_path, language=language, model_name=model_name,
             speaker_names=speaker_names, speaker_hints=speaker_hints,
             need_word_timestamps=need_word_timestamps,
         )
-    elif _BACKEND == "whisperx":
+    elif backend == "whisperx":
         text, segments = _transcribe_whisperx(
             file_path, language=language, model_name=model_name,
             speaker_names=speaker_names, speaker_hints=speaker_hints,
@@ -163,7 +237,7 @@ def transcribe(
 
     out_dir = output_dir or file_path.parent
     (out_dir / f"{file_path.stem}.txt").write_text(text, encoding="utf-8")
-    print(f"[{_BACKEND}] Saved: {out_dir / file_path.stem}.txt")
+    print(f"[{backend}] Saved: {out_dir / file_path.stem}.txt")
 
     if segments:
         (out_dir / f"{file_path.stem}.words.json").write_text(
@@ -181,13 +255,52 @@ def transcribe_with_timestamps(
     device: str | None = None,
 ) -> tuple[str, list[dict]]:
     """Return (text, word_segments) with word-level timestamps (for video sync)."""
-    if _BACKEND == "mlx":
+    # SenseVoice has no word-timestamp output → use whichever Whisper backend
+    # is available, preferring MLX.
+    if _mlx_whisper is not None:
         return _transcribe_mlx(file_path, language=language, model_name=model_name,
                                need_word_timestamps=True)
-    if _BACKEND == "whisperx":
+    if _whisperx is not None:
         return _transcribe_whisperx(file_path, language=language, model_name=model_name,
                                     need_word_timestamps=True)
     return _transcribe_whisper(file_path, language=language, model_name=model_name)
+
+
+# ── SenseVoice backend (zh/en/yue/ja/ko code-switching) ───────────────────────
+
+# Strip SenseVoice's special tags like <|zh|><|NEUTRAL|><|Speech|><|woitn|>.
+_SENSEVOICE_TAG_RE = re.compile(r"<\|[^|]*\|>")
+
+
+def _transcribe_sensevoice(
+    file_path: Path,
+    language: str | None,
+    speaker_names: list[str] | None = None,
+    speaker_hints: str = "",
+) -> tuple[str, list[dict]]:
+    model = _load_sensevoice_model()
+    # SenseVoice accepts: "auto", "zh", "en", "yue", "ja", "ko", "nospeech".
+    # None from CLI maps to "auto" — this is the code-switching path.
+    sv_lang = language if language in ("zh", "en", "yue", "ja", "ko") else "auto"
+
+    res = model.generate(
+        input=str(file_path),
+        cache={},
+        language=sv_lang,
+        use_itn=True,
+        batch_size_s=60,
+        merge_vad=True,
+        merge_length_s=15,
+    )
+
+    raw = res[0]["text"] if res else ""
+    text = _SENSEVOICE_TAG_RE.sub("", raw).strip()
+
+    if speaker_names and not is_labeled(text):
+        text = _claude_label(text, speaker_names, speaker_hints)
+
+    # SenseVoice does not expose word timestamps in this path.
+    return text, []
 
 
 # ── MLX backend (Apple Silicon GPU + Neural Engine) ───────────────────────────
@@ -363,7 +476,9 @@ def _claude_label(
     hints: str = "",
     model: str = "claude-sonnet-4-6",
 ) -> str:
-    from anthropic import Anthropic
+    """Label two-speaker turns via Claude. On any API failure, returns the
+    unlabeled transcript so a workspace cap / network error doesn't break
+    the whole transcribe flow."""
     a = speaker_names[0]
     b = speaker_names[1] if len(speaker_names) > 1 else "Speaker B"
     hint_block = f"\nHints:\n{hints.strip()}\n" if hints.strip() else ""
@@ -374,14 +489,91 @@ def _claude_label(
         f"Preserve every word exactly. Each turn on a new line. "
         f"Return ONLY the labeled transcript.\n\nTranscript:\n{transcript}"
     )
-    response = Anthropic().messages.create(
-        model=model, max_tokens=8096,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text.strip()
+    try:
+        from anthropic import Anthropic
+        response = Anthropic().messages.create(
+            model=model, max_tokens=8096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"[label] Skipped speaker labeling: {e}")
+        return transcript
 
 
 # ── Public helpers ─────────────────────────────────────────────────────────────
+
+def clean_transcript(
+    transcript: str,
+    *,
+    lang: str | None = None,
+    model: str = "claude-sonnet-4-6",
+    max_tokens: int = 16384,
+) -> str:
+    """Post-process an ASR transcript with Claude to fix mishearings.
+
+    Targets the typical SenseVoice/Whisper failure modes on code-switched
+    zh/en audio: English technical jargon transcribed as Chinese homophones
+    (e.g. "colre" → "Cline", "Cco" → "Claude Code", "MCP servver" → "MCP server"),
+    and Chinese phrases corrupted by adjacent English. Preserves every semantic
+    unit (no summarizing) and any [Name]: speaker labels.
+
+    Returns the cleaned text. On any API error returns the original unchanged.
+    """
+    if not transcript or not transcript.strip():
+        return transcript
+
+    lang_hint = {
+        "zh": "The audio is primarily Chinese with English technical terms mixed in.",
+        "en": "The audio is primarily English with some non-English terms.",
+    }.get(lang or "", "The audio mixes Chinese and English (code-switching).")
+
+    prompt = (
+        "You are cleaning a raw automatic-speech-recognition (ASR) transcript. "
+        f"{lang_hint}\n\n"
+        "The ASR often mishears English technical jargon as Chinese homophones, "
+        "or garbles English words inside Chinese sentences. Common examples:\n"
+        "  - 'colre', 'co re', 'clo code' → likely 'Claude Code', 'code', or 'Cline'\n"
+        "  - 'Cco', 'CC' → likely 'Claude Code'\n"
+        "  - 'MCP servver', 'MCP serv' → 'MCP server'\n"
+        "  - 'K见' → '回见'  (Chinese homophone for 'see you')\n"
+        "  - 'launing on graph' → 'LangGraph'\n"
+        "  - English word fragments stuck together: 'projectject' → 'project'\n\n"
+        "Rules:\n"
+        "1. Fix obvious ASR errors using context. Restore English technical "
+        "terms (AI tool names, programming concepts, framework names).\n"
+        "2. Fix Chinese homophone errors that are clearly mishearings.\n"
+        "3. PRESERVE every semantic unit — do NOT summarize, condense, or "
+        "paraphrase. Output should be roughly the same length as input.\n"
+        "4. Preserve [Name]: speaker labels if present, exactly as-is.\n"
+        "5. Preserve natural code-switching — keep English where the speaker "
+        "meant English, Chinese where they meant Chinese. Never translate.\n"
+        "6. Light punctuation cleanup is fine; do not restructure paragraphs.\n"
+        "7. If a fragment is ambiguous, leave it alone rather than guess.\n\n"
+        "Return ONLY the cleaned transcript. No preamble, no explanations, "
+        "no markdown fences.\n\n"
+        "Raw transcript:\n"
+        f"{transcript}"
+    )
+
+    try:
+        from anthropic import Anthropic
+        response = Anthropic().messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        cleaned = response.content[0].text.strip()
+        # Guard against Claude returning a meta-response or empty string.
+        if not cleaned or len(cleaned) < len(transcript) * 0.3:
+            print(f"[clean] Suspicious output (in={len(transcript)} out="
+                  f"{len(cleaned)}), keeping original")
+            return transcript
+        return cleaned
+    except Exception as e:
+        print(f"[clean] Skipped: {e}")
+        return transcript
+
 
 def label_speakers(
     transcript: str,
