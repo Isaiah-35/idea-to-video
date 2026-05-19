@@ -1,19 +1,29 @@
-"""Gradio UI for the idea-to-video pipeline — Phase 2."""
+"""Gradio UI for the idea-to-video pipeline — Phase 2 + 3 + 4."""
 import json
+import os
+import shutil
+import sqlite3
 import subprocess
 import tempfile
+import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import gradio as gr
 
 from brand import load_brand, save_brand, brand_prefix
 from preproduction import load_preproduction, save_preproduction, preproduction_prefix
-from session import save_session, load_latest_session
-from transcribe import transcribe
+from session import save_session, load_latest_session, build_scene_graph
+from transcribe import transcribe, clean_transcript
 from extract_topics import extract_topics
 from write_script import write_script, write_script_sections, STYLES
 from kokoro_tts import generate, generate_sections
 from speak import text_to_speech
+from generate_images import generate_images
+from hook_variants import generate_hook_variants
+from repurpose import extract_clips
+from settings import load_settings, save_settings, get_api_key_status
+from visual_sources import acquire_visuals, detect_available_backends
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -23,23 +33,21 @@ KOKORO_VOICES = {
     "zh": ["zf_xiaobei", "zf_xiaoni", "zm_yunjian"],
 }
 
+CLAUDE_MODELS = ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"]
+
+_MODEL_COSTS = {
+    "claude-sonnet-4-6":          ("$0.003/1K in + $0.015/1K out", "$0.01"),
+    "claude-opus-4-6":            ("$0.015/1K in + $0.075/1K out", "$0.05"),
+    "claude-haiku-4-5-20251001":  ("$0.00025/1K in + $0.00125/1K out", "$0.001"),
+}
+
 
 def _make_slide_images(topics: list[dict], img_dir: Path) -> None:
-    """Generate simple title-card JPEGs (one per topic) when no images are uploaded."""
-    from PIL import Image, ImageDraw, ImageFont
-
-    for i, topic in enumerate(topics, start=1):
-        img = Image.new("RGB", (1920, 1080), color=(18, 18, 30))
-        draw = ImageDraw.Draw(img)
-        title = topic.get("title", f"Topic {i}")
-        try:
-            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 96)
-        except Exception:
-            font = ImageFont.load_default()
-        bbox = draw.textbbox((0, 0), title, font=font)
-        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text(((1920 - w) // 2, (1080 - h) // 2), title, font=font, fill=(220, 220, 255))
-        img.save(str(img_dir / f"img{i:03d}.jpg"), quality=92)
+    """Generate title-card JPEGs — delegates to generate_images with pillow backend."""
+    scenes = [{"title": t.get("title", f"Topic {i+1}"),
+               "image_prompt": t.get("image_prompt", "")}
+              for i, t in enumerate(topics)]
+    generate_images(scenes, img_dir, backend="pillow", overwrite=True)
 
 
 def _build_storyboard(topics: list[dict], sections: list[str]) -> str:
@@ -62,6 +70,34 @@ def _extra_context(pp_goal, pp_aud, pp_emo, pp_cta) -> str:
     return preproduction_prefix(pp)
 
 
+def _diff_html(script_a: str, script_b: str, label_a: str = "Without brand",
+               label_b: str = "With brand") -> str:
+    """Return side-by-side HTML showing word-level additions in script_b vs script_a."""
+    import difflib
+    import html as _html
+    words_a = script_a.split()
+    words_b = script_b.split()
+    sm = difflib.SequenceMatcher(None, words_a, words_b, autojunk=False)
+    highlighted = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            highlighted.extend(_html.escape(w) for w in words_b[j1:j2])
+        elif tag in ("replace", "insert"):
+            for w in words_b[j1:j2]:
+                highlighted.append(f'<span style="background:#1a4a1a;color:#6fda6f;">{_html.escape(w)}</span>')
+        # deletions are simply omitted from the "with brand" side
+
+    with_brand_html = " ".join(highlighted)
+    return (
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">'
+        f'<div><strong style="color:#aaa">{label_a}</strong>'
+        f'<p style="color:#ccc;font-size:0.9em;white-space:pre-wrap;">{_html.escape(script_a)}</p></div>'
+        f'<div><strong style="color:#6fda6f">{label_b}</strong>'
+        f'<p style="color:#ccc;font-size:0.9em;">{with_brand_html}</p></div>'
+        '</div>'
+    )
+
+
 # ── Tab 0: Brand Context ──────────────────────────────────────────────────────
 
 def run_load_brand():
@@ -78,14 +114,93 @@ def run_preview_brand(name, audience, tone, style_notes):
     return prefix if prefix else "(no brand context set — fields are empty)"
 
 
+# ── Voice Memos picker ────────────────────────────────────────────────────────
+
+VOICE_MEMOS_DIR = (
+    Path.home()
+    / "Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings"
+)
+# Core Data epoch is 2001-01-01 UTC; rows store seconds since then.
+_CORE_DATA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+def list_voice_memos(limit: int = 50) -> list[tuple[str, str]]:
+    """Return [(label, path), ...] of recent Voice Memos, newest first.
+
+    Label is "Mon D, h:MM AM — Title (Xm SSs)". Title falls back to the
+    filename stem when ZCUSTOMLABEL is empty.
+    """
+    if not VOICE_MEMOS_DIR.is_dir():
+        return []
+
+    db = VOICE_MEMOS_DIR / "CloudRecordings.db"
+    rows: list[tuple[str, str]] = []
+
+    if db.exists():
+        try:
+            # Read-only URI so we never lock the live DB.
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            cur = con.execute(
+                "SELECT ZCUSTOMLABEL, ZPATH, ZDATE, ZDURATION "
+                "FROM ZCLOUDRECORDING WHERE ZPATH IS NOT NULL "
+                "ORDER BY ZDATE DESC LIMIT ?",
+                (limit,),
+            )
+            for label, path, zdate, dur in cur:
+                full = VOICE_MEMOS_DIR / (path or "")
+                if not full.exists():
+                    continue
+                local = (_CORE_DATA_EPOCH
+                         + timedelta(seconds=float(zdate or 0))).astimezone()
+                date_str = local.strftime("%b %-d, %-I:%M %p")
+                secs = int(dur or 0)
+                dur_str = f"{secs // 60}m{secs % 60:02d}s"
+                title = (label or "").strip() or full.stem
+                rows.append((f"{date_str} — {title} ({dur_str})", str(full)))
+            con.close()
+        except sqlite3.Error:
+            rows = []
+
+    if not rows:
+        # Fallback: filesystem listing if DB read failed.
+        for p in sorted(VOICE_MEMOS_DIR.glob("*.m4a"),
+                        key=lambda x: x.stat().st_mtime, reverse=True)[:limit]:
+            rows.append((p.stem, str(p)))
+
+    return rows
+
+
+def refresh_voice_memos():
+    """Rebuild the picker choices and clear the current selection."""
+    return gr.update(choices=list_voice_memos(), value=None)
+
+
+def load_voice_memo(path: str | None):
+    """Selecting a memo updates the audio component with its file path."""
+    return path or None
+
+
 # ── Tab 1: Transcribe ─────────────────────────────────────────────────────────
 
-def run_transcribe(audio_path, lang, model):
+def run_transcribe(audio_path, lang, model, speaker_a, speaker_b, hints, claude_cleanup):
     if audio_path is None:
         return "Record or upload an audio file first."
     language = None if lang == "auto" else lang
+    a = speaker_a.strip() if speaker_a else ""
+    b = speaker_b.strip() if speaker_b else ""
+    speaker_names = [a, b] if a and b else None
+    claude_model = load_settings()["claude_model"]
     with tempfile.TemporaryDirectory() as tmp:
-        text = transcribe(Path(audio_path), language=language, model_name=model, output_dir=Path(tmp))
+        text = transcribe(
+            Path(audio_path),
+            language=language,
+            model_name=model,
+            output_dir=Path(tmp),
+            speaker_names=speaker_names,
+            speaker_hints=hints or "",
+        )
+    if claude_cleanup:
+        text = clean_transcript(text, lang=language, model=claude_model)
     return text
 
 
@@ -96,10 +211,11 @@ def run_extract_topics(transcript, num_topics, lang,
     if not transcript.strip():
         return "Paste or transcribe text first.", "[]"
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
-    extra = preproduction_prefix()   # auto-loads from preproduction.json
+    extra = preproduction_prefix()
+    claude_model = load_settings()["claude_model"]
     try:
         topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang,
-                                brand=brand, extra_context=extra)
+                                brand=brand, extra_context=extra, model=claude_model)
     except Exception as e:
         return f"Error: {e}", "[]"
     display = "\n\n".join(
@@ -120,11 +236,114 @@ def run_write_script(topics_json, lang, style,
     if not topics:
         return "No topics found. Run Extract Topics first.", "[]", ""
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
-    extra = preproduction_prefix()   # auto-loads from preproduction.json
-    sections = write_script_sections(topics, lang=lang, style=style, brand=brand, extra_context=extra)
+    extra = preproduction_prefix()
+    claude_model = load_settings()["claude_model"]
+    sections = write_script_sections(topics, lang=lang, style=style,
+                                     brand=brand, extra_context=extra, model=claude_model)
     full_script = "\n\n".join(sections)
     storyboard = _build_storyboard(topics, sections)
     return full_script, json.dumps(sections, ensure_ascii=False, indent=2), storyboard
+
+
+def run_compare_brand(topics_json, lang, style):
+    """Generate script with and without brand, return side-by-side diff HTML."""
+    try:
+        topics = json.loads(topics_json)
+    except (json.JSONDecodeError, TypeError):
+        return "", "<p style='color:#888'>Run Write Script first to compare.</p>"
+    if not topics:
+        return "", "<p style='color:#888'>No topics — run Extract Topics first.</p>"
+    extra = preproduction_prefix()
+    claude_model = load_settings()["claude_model"]
+    try:
+        sections_no_brand = write_script_sections(topics, lang=lang, style=style,
+                                                  brand=None, extra_context=extra,
+                                                  model=claude_model)
+        brand = load_brand()
+        sections_with_brand = write_script_sections(topics, lang=lang, style=style,
+                                                    brand=brand, extra_context=extra,
+                                                    model=claude_model)
+    except Exception as e:
+        return "", f"<p style='color:red'>Error: {e}</p>"
+
+    script_no = "\n\n".join(sections_no_brand)
+    script_with = "\n\n".join(sections_with_brand)
+    html = _diff_html(script_no, script_with)
+    return script_no, html
+
+
+# ── Tab 3: Generate Images ────────────────────────────────────────────────────
+
+def run_generate_images_tab3(topics_json, sections_json):
+    try:
+        topics = json.loads(topics_json)
+    except (json.JSONDecodeError, TypeError):
+        return [], "", "Invalid topics JSON.", []
+    if not topics:
+        return [], "", "No topics — run Extract Topics first.", []
+
+    img_dir = Path(tempfile.mkdtemp(prefix="itv_imgs_"))
+    try:
+        result_scenes = generate_images(topics, img_dir, backend="auto", overwrite=True)
+    except Exception as e:
+        return [], "", f"Error: {e}", []
+
+    gallery = [s["image_path"] for s in result_scenes if s.get("image_path")]
+    # Return gallery twice: once for the Tab 3 gallery display, once to pre-fill Tab 6 v_images
+    return gallery, str(img_dir), f"Generated {len(gallery)} images in {img_dir}", gallery
+
+
+# ── Tab 3: Hook variants ──────────────────────────────────────────────────────
+
+def run_generate_hooks(topics_json, lang, b_name, b_aud, b_tone, b_style):
+    try:
+        topics = json.loads(topics_json)
+    except (json.JSONDecodeError, TypeError):
+        return gr.update(choices=[], value=None, visible=False), "[]", "Invalid topics JSON."
+    if not topics:
+        return gr.update(choices=[], value=None, visible=False), "[]", "No topics — run Extract Topics first."
+    brand = {"name": b_name, "audience": b_aud, "tone": b_tone, "style_notes": b_style}
+    claude_model = load_settings()["claude_model"]
+    try:
+        variants = generate_hook_variants(topics, lang=lang, brand=brand, model=claude_model)
+    except Exception as e:
+        return gr.update(choices=[], value=None, visible=False), "[]", f"Error: {e}"
+
+    choices = [f"{v['label']}: {v['hook']}" for v in variants]
+    hooks_json = json.dumps(variants, ensure_ascii=False, indent=2)
+    return gr.update(choices=choices, value=choices[0], visible=True), hooks_json, "3 hooks generated."
+
+
+def run_select_hook(selected_label_hook, hooks_json, current_full_script, current_sections_json):
+    """Prepend the selected hook as the first paragraph of the script."""
+    if not selected_label_hook:
+        return current_full_script, current_sections_json
+    try:
+        variants = json.loads(hooks_json) if hooks_json and hooks_json.strip() != "[]" else []
+    except (json.JSONDecodeError, TypeError):
+        return current_full_script, current_sections_json
+
+    selected_hook = None
+    for v in variants:
+        label = v.get("label", "")
+        if selected_label_hook.startswith(label + ":"):
+            selected_hook = v["hook"]
+            break
+    if not selected_hook:
+        return current_full_script, current_sections_json
+
+    try:
+        sections = json.loads(current_sections_json) if current_sections_json else []
+    except (json.JSONDecodeError, TypeError):
+        sections = []
+
+    if sections:
+        sections = [selected_hook + " " + sections[0]] + sections[1:]
+    else:
+        sections = [selected_hook]
+
+    updated_script = "\n\n".join(sections)
+    return updated_script, json.dumps(sections, ensure_ascii=False, indent=2)
 
 
 # ── Tab 4: Kokoro TTS ─────────────────────────────────────────────────────────
@@ -208,10 +427,12 @@ def run_make_video(audio_path, durations_path, image_files, topics_json):
 def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
                       b_name, b_audience, b_tone, b_style,
                       pp_goal, pp_aud, pp_emo, pp_cta,
+                      visual_src,
                       progress=gr.Progress()):
     brand = {"name": b_name, "audience": b_audience, "tone": b_tone, "style_notes": b_style}
     pp = {"goal": pp_goal, "audience": pp_aud, "emotion": pp_emo, "cta": pp_cta}
     extra = preproduction_prefix(pp)
+    claude_model = load_settings()["claude_model"]
     log_lines = []
 
     def log(msg):
@@ -219,37 +440,86 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         return "\n".join(log_lines)
 
     if audio is None:
-        return None, None, "[]", "", "Record or upload audio first.", ""
+        return None, None, "[]", "", "Record or upload audio first.", "", ""
 
     # Step 1: Transcribe
     progress(0.05, desc="Step 1/5 · Transcribing audio…")
     with tempfile.TemporaryDirectory() as tmp:
         transcript = transcribe(Path(audio), language=None if lang == "auto" else lang,
                                 model_name=model, output_dir=Path(tmp))
+    # Claude cleanup of ASR mis-reads (English jargon mis-heard as Chinese,
+    # homophones). Falls back to raw transcript on any error.
+    transcript = clean_transcript(transcript,
+                                  lang=None if lang == "auto" else lang,
+                                  model=claude_model)
     status = log(f"✓ Step 1/5 · Transcribed ({len(transcript.split())} words)")
 
     # Step 2: Extract topics
-    progress(0.25, desc="Step 2/5 · Extracting topics with Claude…")
+    progress(0.20, desc="Step 2/5 · Extracting topics with Claude…")
     try:
         topics = extract_topics(transcript, num_topics=int(num_topics), lang=lang,
-                                brand=brand, extra_context=extra)
+                                brand=brand, extra_context=extra, model=claude_model)
     except Exception as e:
-        return None, transcript, "[]", "[]", log(f"✗ Step 2/5 · Extract topics failed: {e}"), ""
+        return None, transcript, "[]", "[]", log(f"✗ Step 2/5 · Extract topics failed: {e}"), "", ""
     topics_json = json.dumps(topics, ensure_ascii=False, indent=2)
     status = log(f"✓ Step 2/5 · Extracted {len(topics)} topics")
 
     # Step 3: Write script
-    progress(0.45, desc="Step 3/5 · Writing script with Claude…")
+    progress(0.38, desc="Step 3/5 · Writing script with Claude…")
     try:
         sections = write_script_sections(topics, lang=lang, style=style,
-                                         brand=brand, extra_context=extra)
+                                         brand=brand, extra_context=extra, model=claude_model)
     except Exception as e:
-        return None, transcript, topics_json, "[]", log(f"✗ Step 3/5 · Write script failed: {e}"), ""
+        return None, transcript, topics_json, "[]", log(f"✗ Step 3/5 · Write script failed: {e}"), "", ""
     full_script = "\n\n".join(sections)
     status = log(f"✓ Step 3/5 · Script written ({len(sections)} sections)")
 
+    # Step 3.5: Acquire visuals
+    progress(0.52, desc="Step 3.5/5 · Acquiring visuals…")
+    img_dir = Path(tempfile.mkdtemp(prefix="itv_pipeline_imgs_"))
+    generated_image_paths: list[str | None] = []
+    scenes_with_visuals: list[dict] = []
+    if image_files:
+        for i, img_path in enumerate(sorted(image_files), start=1):
+            src = Path(img_path)
+            dst = img_dir / f"img{i:03d}.jpg"
+            dst.write_bytes(src.read_bytes())
+            generated_image_paths.append(str(dst))
+        # Treat uploaded images as pillow type for assembly
+        scenes_with_visuals = build_scene_graph(topics, sections)
+        for i, s in enumerate(scenes_with_visuals):
+            s = dict(s)
+            s["visual_path"] = generated_image_paths[i] if i < len(generated_image_paths) else None
+            s["visual_type"] = "image"
+            scenes_with_visuals[i] = s
+        status = log(f"  (using {len(image_files)} uploaded images)")
+    else:
+        try:
+            scenes_for_visuals = build_scene_graph(topics, sections)
+            scenes_with_visuals = acquire_visuals(
+                scenes_for_visuals, img_dir,
+                backend=visual_src,
+                progress_callback=lambda i, total, src: progress(
+                    0.52 + 0.08 * (i / total),
+                    desc=f"Step 3.5/5 · Generating visuals ({src}, {i}/{total})…"
+                ),
+            )
+            generated_image_paths = [s.get("visual_path") for s in scenes_with_visuals]
+            status = log(f"✓ Step 3.5/5 · {len(generated_image_paths)} visuals acquired ({visual_src})")
+        except Exception as e:
+            # Non-fatal: fall back to pillow title cards
+            _make_slide_images(topics, img_dir)
+            generated_image_paths = [str(img_dir / f"img{i+1:03d}.jpg") for i in range(len(topics))]
+            scenes_with_visuals = build_scene_graph(topics, sections)
+            for i, s in enumerate(scenes_with_visuals):
+                s = dict(s)
+                s["visual_path"] = generated_image_paths[i]
+                s["visual_type"] = "image"
+                scenes_with_visuals[i] = s
+            status = log(f"  (visual acquisition warning: {e} — using title cards)")
+
     # Step 4: Generate TTS
-    progress(0.60, desc="Step 4/5 · Generating Kokoro TTS (local, free)…")
+    progress(0.68, desc="Step 4/5 · Generating Kokoro TTS (local, free)…")
     audio_out = Path(tempfile.mktemp(suffix=".wav"))
     durations_out = Path(tempfile.mktemp(suffix=".txt"))
     try:
@@ -257,35 +527,47 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         durations_out.write_text("\n".join(f"{d:.3f}" for d in durations), "utf-8")
         status = log(f"✓ Step 4/5 · TTS generated ({sum(durations):.1f}s total)")
     except Exception as e:
-        return None, transcript, topics_json, full_script, log(f"✗ Step 4/5 · TTS failed: {e}"), ""
+        shutil.rmtree(img_dir, ignore_errors=True)
+        return None, transcript, topics_json, full_script, log(f"✗ Step 4/5 · TTS failed: {e}"), "", ""
 
     # Step 5: Assemble video
-    progress(0.80, desc="Step 5/5 · Assembling video with ffmpeg (local, free)…")
-    with tempfile.TemporaryDirectory() as img_dir:
-        img_dir_path = Path(img_dir)
+    progress(0.84, desc="Step 5/5 · Assembling video with ffmpeg (local, free)…")
+    video_out = Path(tempfile.mktemp(suffix=".mp4"))
 
-        if image_files:
-            for i, img_path in enumerate(sorted(image_files), start=1):
-                src = Path(img_path)
-                dst = img_dir_path / f"img{i:03d}.jpg"
-                dst.write_bytes(src.read_bytes())
-        else:
-            _make_slide_images(topics, img_dir_path)
-            status = log("  (auto-generated title cards from topic names)")
+    # Update scenes_with_visuals with per-section durations
+    for i, s in enumerate(scenes_with_visuals):
+        s = dict(s)
+        s["duration_s"] = durations[i] if i < len(durations) else None
+        scenes_with_visuals[i] = s
 
-        video_out = Path(tempfile.mktemp(suffix=".mp4"))
-        script = Path(__file__).parent / "make_video.sh"
+    visual_types = {s.get("visual_type") for s in scenes_with_visuals}
+    if "video" in visual_types:
+        try:
+            from assemble_video import assemble
+            assemble(audio_out, scenes_with_visuals, video_out)
+        except Exception as e:
+            shutil.rmtree(img_dir, ignore_errors=True)
+            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video assembly failed: {e}"), "", ""
+    else:
+        script_sh = Path(__file__).parent / "make_video.sh"
         result = subprocess.run(
-            ["bash", str(script), str(img_dir_path), str(audio_out), str(video_out), str(durations_out)],
+            ["bash", str(script_sh), str(img_dir), str(audio_out), str(video_out), str(durations_out)],
             capture_output=True, text=True,
         )
-
-    ffmpeg_log = (result.stdout + result.stderr).strip()
-    if not video_out.exists() or video_out.stat().st_size < 1000:
-        return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), ""
+        ffmpeg_log = (result.stdout + result.stderr).strip()
+        if not video_out.exists() or video_out.stat().st_size < 1000:
+            shutil.rmtree(img_dir, ignore_errors=True)
+            return None, transcript, topics_json, full_script, log(f"✗ Step 5/5 · Video failed:\n{ffmpeg_log}"), "", ""
 
     progress(1.0, desc="Done!")
     status = log(f"✓ Step 5/5 · Video ready ({video_out.stat().st_size // 1024} KB)")
+
+    # Build scene graph
+    scenes = build_scene_graph(
+        topics, sections,
+        image_paths=generated_image_paths,
+        durations=durations,
+    )
 
     # Save session
     session_path = save_session({
@@ -294,14 +576,17 @@ def run_full_pipeline(audio, lang, model, num_topics, style, voice, image_files,
         "topics_json": topics_json,
         "full_script": full_script,
         "sections_json": json.dumps(sections, ensure_ascii=False),
+        "scenes_json": json.dumps(scenes, ensure_ascii=False),
         "lang": lang,
         "style": style,
         "brand": brand,
         "preproduction": pp,
     })
     session_msg = f"Session saved: {session_path.name}"
+    scenes_json_out = json.dumps(scenes, ensure_ascii=False)
+    shutil.rmtree(img_dir, ignore_errors=True)
 
-    return str(video_out), transcript, topics_json, full_script, status, session_msg
+    return str(video_out), transcript, topics_json, full_script, status, session_msg, scenes_json_out
 
 
 # ── Tab 7: Session restore ────────────────────────────────────────────────────
@@ -334,15 +619,71 @@ def run_preview_preproduction(goal, audience, emotion, cta):
     return prefix if prefix else "(no pre-production context set — fields are empty)"
 
 
+# ── Tab 9: Settings ───────────────────────────────────────────────────────────
+
+def _cost_estimate(model: str) -> str:
+    pricing, approx = _MODEL_COSTS.get(model, ("unknown", "?"))
+    return f"Estimated cost per run: ~{approx}  ({pricing}, ~3 calls × ~500 tokens)"
+
+
+def run_save_settings(claude_model, whisper_backend):
+    save_settings({"claude_model": claude_model, "whisper_backend": whisper_backend})
+    return "Saved to settings.json.", _cost_estimate(claude_model)
+
+
+def run_load_settings_ui():
+    s = load_settings()
+    model = s.get("claude_model", "claude-sonnet-4-6")
+    backend = s.get("whisper_backend", "whisper")
+    key_status = ("✓ ANTHROPIC_API_KEY set" if os.environ.get("ANTHROPIC_API_KEY")
+                  else "✗ ANTHROPIC_API_KEY not set")
+    return model, backend, _cost_estimate(model), key_status, "Loaded."
+
+
+# ── Tab 10: Repurpose ─────────────────────────────────────────────────────────
+
+def run_repurpose(video_path, scenes_json, max_duration):
+    if video_path is None:
+        return None, "Upload a video first."
+    try:
+        scenes = json.loads(scenes_json) if scenes_json and scenes_json.strip() not in ("", "[]") else []
+    except (json.JSONDecodeError, TypeError):
+        return None, "Invalid scenes JSON."
+    if not scenes:
+        return None, "No scenes found. Run the full pipeline first (Tab 7)."
+
+    out_dir = Path(tempfile.mkdtemp(prefix="itv_clips_"))
+    try:
+        clips = extract_clips(Path(video_path), scenes, out_dir, max_duration=float(max_duration))
+    except Exception as e:
+        return None, f"Error: {e}"
+
+    if not clips:
+        return None, "No clips extracted (check scene durations and max_duration setting)."
+
+    # Zip clips
+    zip_path = Path(tempfile.mktemp(suffix=".zip"))
+    with zipfile.ZipFile(str(zip_path), "w", zipfile.ZIP_DEFLATED) as zf:
+        for clip in clips:
+            zf.write(clip["path"], Path(clip["path"]).name)
+
+    log_lines = [f"Extracted {len(clips)} clips:"]
+    for c in clips:
+        log_lines.append(f"  {Path(c['path']).name}  ({c['duration_s']:.1f}s)")
+    return str(zip_path), "\n".join(log_lines)
+
+
 # ── Layout ────────────────────────────────────────────────────────────────────
 
 _b  = load_brand()
 _pp = load_preproduction()
+_s  = load_settings()
 
 with gr.Blocks(title="idea-to-video") as demo:
     gr.Markdown("# idea-to-video\n`Talk → Transcribe → Topics → Script → TTS → Video`")
 
     # Shared brand state (hidden, loaded once, synced from Tab 0)
+    # CRITICAL: max 4 gr.State() before gr.Tabs() to avoid Gradio bug
     b_name  = gr.State(_b["name"])
     b_aud   = gr.State(_b["audience"])
     b_tone  = gr.State(_b["tone"])
@@ -377,13 +718,43 @@ with gr.Blocks(title="idea-to-video") as demo:
 
         # ── Tab 1: Transcribe ──
         with gr.Tab("1 · Transcribe", id=1):
-            gr.Markdown("Record live or upload audio → speech-to-text (WhisperX if installed, else Whisper).")
+            gr.Markdown(
+                "Upload, record, or pick from Voice Memos → labeled transcript in one step.\n\n"
+                "**Code-switched audio (e.g. 80% Chinese + 20% English):** keep "
+                "language on `auto`. The default backend is SenseVoice-Small, which "
+                "detects language per utterance — Whisper locks one language per "
+                "30s window, so it mangles short English insertions in Chinese audio.\n\n"
+                "**For conversations:** fill in speaker names before clicking Transcribe. "
+                "WhisperX diarization is used when `HF_TOKEN` is set (auto falls back "
+                "from SenseVoice to MLX-Whisper for the diarization path); otherwise "
+                "Claude infers turns. Leave names blank for solo recordings."
+            )
+            with gr.Row():
+                t_vm_picker = gr.Dropdown(
+                    choices=list_voice_memos(),
+                    label="📱 Pick from Mac Voice Memos (newest first)",
+                    value=None, scale=5,
+                )
+                t_vm_refresh = gr.Button("🔄 Refresh", scale=1)
             t_audio = gr.Audio(label="Audio", sources=["microphone", "upload"], type="filepath")
             with gr.Row():
                 t_lang  = gr.Dropdown(["auto", "en", "zh"], value="auto", label="Language")
-                t_model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="base", label="Whisper model")
+                t_model = gr.Dropdown(["tiny", "base", "small", "medium", "large"], value="base", label="Whisper model (fallback only)")
+                t_cleanup = gr.Checkbox(
+                    value=True,
+                    label="Clean with Claude",
+                    info="Fixes ASR mis-reads of English jargon in zh/en code-switched audio. +~10s, ~$0.02 per transcript.",
+                )
+            with gr.Row():
+                t_speaker_a = gr.Textbox(label="Speaker A name", placeholder="e.g. Paul (leave blank for solo)", scale=1)
+                t_speaker_b = gr.Textbox(label="Speaker B name", placeholder="e.g. Sam (leave blank for solo)", scale=1)
+            t_hints = gr.Textbox(
+                label="Speaker hints (optional — helps Claude distinguish voices)",
+                placeholder="e.g. Paul asks most questions. Sam explains technical details. Paul comments last.",
+                lines=2,
+            )
             t_run  = gr.Button("Transcribe", variant="primary")
-            t_out  = gr.Textbox(label="Transcript", lines=8)
+            t_out  = gr.Textbox(label="Transcript", lines=10)
             t_send = gr.Button("→ Extract Topics")
 
         # ── Tab 2: Extract Topics ──
@@ -408,10 +779,31 @@ with gr.Blocks(title="idea-to-video") as demo:
             w_run      = gr.Button("Write Script", variant="primary")
             w_out      = gr.Textbox(label="Full Script", lines=10)
             w_sections = gr.Textbox(label="Sections JSON", lines=4, visible=False)
+
             with gr.Accordion("Storyboard preview", open=False):
                 gr.Markdown("*Card-per-slide view — verify structure before committing to TTS.*")
                 w_storyboard = gr.HTML(value="<p style='color:#888'>Run Write Script to preview storyboard.</p>")
-            w_send     = gr.Button("→ Kokoro TTS")
+
+                # Generate Images (Phase 3)
+                w_gen_img_btn = gr.Button("Generate Images", variant="secondary")
+                w_gallery = gr.Gallery(label="Generated images", columns=3, visible=False)
+                w_images_dir = gr.Textbox(label="Images dir", visible=False)
+                w_img_status = gr.Textbox(label="Image status", interactive=False, visible=False)
+
+            with gr.Accordion("Brand impact — with vs without", open=False):
+                gr.Markdown("*Compare script with brand context applied vs. a generic script — word-level additions highlighted.*")
+                w_compare_btn = gr.Button("Compare: script without brand context", variant="secondary")
+                w_no_brand_script = gr.Textbox(label="Script without brand (hidden)", visible=False)
+                w_diff_html_out = gr.HTML(value="<p style='color:#888'>Click Compare to see brand impact.</p>")
+
+            with gr.Accordion("Hook variants", open=False):
+                gr.Markdown("*Generate 3 opening hooks and pick the best one.*")
+                w_hooks_btn = gr.Button("Generate 3 Opening Hooks", variant="secondary")
+                w_hooks_radio = gr.Radio(choices=[], label="Pick a hook", visible=False)
+                w_hooks_json = gr.Textbox(label="Hooks JSON", visible=False)
+                w_hooks_status = gr.Textbox(label="Hook status", interactive=False, visible=False)
+
+            w_send = gr.Button("→ Kokoro TTS")
 
         # ── Tab 4: Kokoro TTS ──
         with gr.Tab("4 · Kokoro TTS", id=4):
@@ -445,8 +837,8 @@ with gr.Blocks(title="idea-to-video") as demo:
                 "Leave images empty to auto-generate title cards from topic titles."
             )
             with gr.Row():
-                v_audio  = gr.Audio(label="Audio (WAV/MP3)", type="filepath")
-                v_images = gr.File(label="Images (JPG) — sorted by filename", file_count="multiple", file_types=["image"])
+                v_audio  = gr.Audio(label="Audio (auto-filled from Tab 4 TTS)", type="filepath")
+                v_images = gr.File(label="Images (auto-filled from Tab 3 Generate Images)", file_count="multiple", file_types=["image"])
             v_durations = gr.Textbox(label="Durations file (auto-filled from TTS)", visible=False)
             v_topics    = gr.Textbox(label="Topics JSON (for auto-slide generation)", visible=False)
             v_run   = gr.Button("Make Video", variant="primary")
@@ -463,7 +855,7 @@ with gr.Blocks(title="idea-to-video") as demo:
                 "are applied automatically to every Claude call."
             )
             with gr.Row():
-                p_audio  = gr.Audio(label="🎙 Record your idea (or upload)", sources=["microphone", "upload"], type="filepath")
+                p_audio  = gr.Audio(label="Record your idea (or upload)", sources=["microphone", "upload"], type="filepath")
                 p_images = gr.File(label="Slide images (optional — auto-generated if empty)", file_count="multiple", file_types=["image"])
             with gr.Row():
                 p_lang   = gr.Dropdown(["auto", "en", "zh"], value="auto", label="Language")
@@ -471,6 +863,13 @@ with gr.Blocks(title="idea-to-video") as demo:
                 p_topics = gr.Slider(1, 10, value=5, step=1, label="Topics")
                 p_style  = gr.Dropdown(STYLES, value="conversational", label="Style")
                 p_voice  = gr.Dropdown(KOKORO_VOICES["en"], value="af_heart", label="TTS voice")
+            with gr.Row():
+                p_visual_src = gr.Dropdown(
+                    ["auto", "kenburns", "pexels", "fal", "pillow"],
+                    value="auto",
+                    label="Visual source",
+                    info="auto = best available based on API keys set in Tab 9",
+                )
 
             with gr.Accordion("Pre-production context (optional — sets video intent)", open=False):
                 gr.Markdown(
@@ -484,7 +883,7 @@ with gr.Blocks(title="idea-to-video") as demo:
                     pp7_emo  = gr.Textbox(label="Desired emotion", placeholder="e.g. inspired and slightly uncomfortable")
                     pp7_cta  = gr.Textbox(label="CTA", placeholder="e.g. Subscribe at the link below")
 
-            p_run    = gr.Button("▶ Run Full Pipeline", variant="primary", size="lg")
+            p_run    = gr.Button("Run Full Pipeline", variant="primary", size="lg")
             gr.Markdown(
                 "_Free to iterate: Whisper transcription, Kokoro TTS, and ffmpeg video assembly "
                 "all run locally. Only the 3 Claude API calls cost money — approximately $0.01 per run._"
@@ -496,7 +895,9 @@ with gr.Blocks(title="idea-to-video") as demo:
                 p_script_out = gr.Textbox(label="Script", lines=8, interactive=False)
             p_status      = gr.Textbox(label="Progress log", lines=6, interactive=False)
             p_session_info = gr.Textbox(label="Session", interactive=False, visible=False)
-            resume_btn    = gr.Button("↩ Resume last session")
+            # Hidden: scenes JSON for Tab 10 repurpose
+            p_scenes_json = gr.Textbox(label="Scenes JSON", visible=False)
+            resume_btn    = gr.Button("Resume last session")
 
         # ── Tab 8: Pre-production ──
         with gr.Tab("8 · Pre-production", id=8):
@@ -529,11 +930,81 @@ with gr.Blocks(title="idea-to-video") as demo:
             pp_preview.click(run_preview_preproduction,
                              [pp_goal_inp, pp_aud_inp, pp_emo_inp, pp_cta_inp], pp_preview_out)
 
+        # ── Tab 9: Settings ──
+        with gr.Tab("9 · Settings", id=9):
+            gr.Markdown(
+                "Configure Claude model, Whisper backend, and view cost estimates.\n\n"
+                "Changes take effect on the next pipeline run."
+            )
+            with gr.Row():
+                cfg_model = gr.Dropdown(
+                    CLAUDE_MODELS,
+                    value=_s.get("claude_model", "claude-sonnet-4-6"),
+                    label="Claude model",
+                )
+                cfg_whisper = gr.Dropdown(
+                    ["whisper", "whisperx"],
+                    value=_s.get("whisper_backend", "whisper"),
+                    label="Whisper backend",
+                )
+            cfg_cost    = gr.Textbox(
+                label="Cost estimate",
+                value=_cost_estimate(_s.get("claude_model", "claude-sonnet-4-6")),
+                interactive=False,
+            )
+            cfg_key     = gr.Textbox(
+                label="API key status",
+                value=("✓ ANTHROPIC_API_KEY set" if os.environ.get("ANTHROPIC_API_KEY")
+                       else "✗ ANTHROPIC_API_KEY not set"),
+                interactive=False,
+            )
+            cfg_pexels_status = gr.Textbox(
+                label="Pexels API key",
+                value=get_api_key_status()["pexels"],
+                interactive=False,
+            )
+            cfg_fal_status = gr.Textbox(
+                label="fal.ai API key",
+                value=get_api_key_status()["fal"],
+                interactive=False,
+            )
+            with gr.Row():
+                cfg_save_btn = gr.Button("Save settings", variant="primary")
+                cfg_load_btn = gr.Button("Reload from settings.json")
+            cfg_status = gr.Textbox(label="Status", interactive=False)
+
+            # Update cost estimate live when model changes
+            cfg_model.change(_cost_estimate, cfg_model, cfg_cost)
+
+            cfg_save_btn.click(run_save_settings, [cfg_model, cfg_whisper], [cfg_status, cfg_cost])
+            cfg_load_btn.click(run_load_settings_ui,
+                               outputs=[cfg_model, cfg_whisper, cfg_cost, cfg_key, cfg_status])
+
+        # ── Tab 10: Repurpose ──
+        with gr.Tab("10 · Repurpose", id=10):
+            gr.Markdown(
+                "## Cut long video into short clips\n\n"
+                "Upload a video (or use the one from Tab 7) and extract per-scene clips.\n"
+                "Scenes JSON is auto-filled from the last full pipeline run."
+            )
+            with gr.Row():
+                rp_video = gr.Video(label="Input video (auto-filled from Tab 6 or Tab 7)")
+                rp_scenes = gr.Textbox(label="Scenes JSON (auto-filled from Tab 7)", lines=6,
+                                       placeholder='[{"title": "...", "duration_s": 12.3}, ...]')
+            rp_max_dur = gr.Slider(15, 120, value=60, step=5, label="Max clip duration (seconds)")
+            rp_run     = gr.Button("Extract Clips", variant="primary")
+            rp_zip     = gr.File(label="Download clips (ZIP)")
+            rp_log     = gr.Textbox(label="Log", lines=8, interactive=False)
+
+            rp_run.click(run_repurpose, [rp_video, rp_scenes, rp_max_dur], [rp_zip, rp_log])
+
     # ── Wire pipeline ─────────────────────────────────────────────────────────
 
     # Tab 1 → Tab 2
-    t_run.click(run_transcribe, [t_audio, t_lang, t_model], t_out)
+    t_run.click(run_transcribe, [t_audio, t_lang, t_model, t_speaker_a, t_speaker_b, t_hints, t_cleanup], t_out)
     t_send.click(lambda t: (t, gr.update(selected=2)), t_out, [e_transcript, tabs])
+    t_vm_picker.change(load_voice_memo, t_vm_picker, t_audio)
+    t_vm_refresh.click(refresh_voice_memos, None, t_vm_picker)
 
     # Tab 2 → Tab 3
     e_run.click(run_extract_topics,
@@ -552,33 +1023,81 @@ with gr.Blocks(title="idea-to-video") as demo:
         [w_out, w_sections], [k_text, k_sections, tabs]
     )
 
-    # Tab 4
+    # Tab 3: Generate images — 4th output pre-fills Tab 6 Make Video images
+    w_gen_img_btn.click(
+        run_generate_images_tab3,
+        [w_topics, w_sections],
+        [w_gallery, w_images_dir, w_img_status, v_images],
+    )
+    w_gen_img_btn.click(
+        lambda: (gr.update(visible=True), gr.update(visible=True)),
+        None,
+        [w_gallery, w_img_status],
+    )
+
+    # Tab 3: Brand comparison
+    w_compare_btn.click(
+        run_compare_brand,
+        [w_topics, w_lang, w_style],
+        [w_no_brand_script, w_diff_html_out],
+    )
+
+    # Tab 3: Hook variants
+    w_hooks_btn.click(
+        run_generate_hooks,
+        [w_topics, w_lang, b_name, b_aud, b_tone, b_style],
+        [w_hooks_radio, w_hooks_json, w_hooks_status],
+    )
+    w_hooks_btn.click(lambda: gr.update(visible=True), None, w_hooks_status)
+    w_hooks_radio.change(
+        run_select_hook,
+        [w_hooks_radio, w_hooks_json, w_out, w_sections],
+        [w_out, w_sections],
+    )
+
+    # Tab 4 — TTS audio and durations auto-fill Tab 6 Make Video
     k_run.click(run_kokoro, [k_text, k_sections, k_lang, k_voice],
                 [k_audio, k_durations, k_info])
+    k_run.click(lambda a: a, k_audio, v_audio)
     k_run.click(lambda d: d, k_durations, v_durations)
     e_run.click(lambda _, j: j, [e_display, e_json], v_topics)
 
     # Tab 5
     s_run.click(run_speak, [s_text, s_rate, s_volume], [s_audio, s_info])
 
-    # Tab 6
+    # Tab 6 — video output auto-fills Tab 10 Repurpose
     v_run.click(run_make_video, [v_audio, v_durations, v_images, v_topics], [v_video, v_log])
+    v_run.click(lambda v: v, v_video, rp_video)
 
     # Tab 7 — full pipeline (pp7_* inline fields override shared State pp_*)
     p_run.click(
         run_full_pipeline,
         [p_audio, p_lang, p_model, p_topics, p_style, p_voice, p_images,
          b_name, b_aud, b_tone, b_style,
-         pp7_goal, pp7_aud, pp7_emo, pp7_cta],
-        [p_video, p_transcript, p_topics_out, p_script_out, p_status, p_session_info],
+         pp7_goal, pp7_aud, pp7_emo, pp7_cta,
+         p_visual_src],
+        [p_video, p_transcript, p_topics_out, p_script_out, p_status, p_session_info, p_scenes_json],
     )
-    p_run.click(lambda _: gr.update(visible=False), p_status, p_session_info)  # hide before run
+    p_run.click(lambda _: gr.update(visible=False), p_status, p_session_info)
     p_session_info.change(lambda v: gr.update(visible=bool(v)), p_session_info, p_session_info)
+
+    # Tab 7 pipeline video + scenes auto-fill Tab 10 Repurpose
+    p_run.click(lambda v: v, p_video, rp_video)
+    p_scenes_json.change(lambda v: v if v and v != "[]" else gr.update(), p_scenes_json, rp_scenes)
 
     # Resume last session
     resume_btn.click(run_resume_session, [],
                      [p_transcript, p_topics_out, p_script_out, p_session_info])
 
+    # Wire scenes JSON to Tab 10 repurpose: auto-fill from last session
+    resume_btn.click(
+        lambda: (load_latest_session() or {}).get("scenes_json", "[]"),
+        None, rp_scenes,
+    )
+
 
 if __name__ == "__main__":
-    demo.launch()
+    # Whitelist the Mac Voice Memos directory so the picker can hand its
+    # .m4a paths to gr.Audio without tripping Gradio's _check_allowed guard.
+    allowed = [str(VOICE_MEMOS_DIR)] if VOICE_MEMOS_DIR.is_dir() else []
+    demo.launch(allowed_paths=allowed)

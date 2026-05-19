@@ -59,7 +59,7 @@ def test_extract_topics_zh_lang(sample_transcript, sample_topics):
 def test_extract_topics_invalid_json_raises(sample_transcript):
     mock_client = _mock_claude("not valid json at all")
     with patch("extract_topics.Anthropic", return_value=mock_client):
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(ValueError):
             extract_topics(sample_transcript)
 
 

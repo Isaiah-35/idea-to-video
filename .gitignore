@@ -10,3 +10,4 @@ __pycache__/
 .venv/
 preproduction.json
 sessions.json
+.env

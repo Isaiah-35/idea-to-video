@@ -1,6 +1,7 @@
 gradio
 anthropic
 openai-whisper
+funasr  # SenseVoice — zh/en code-switching ASR (default backend)
 kokoro>=0.9
 soundfile
 numpy
@@ -10,5 +11,6 @@ ordered_set
 pypinyin
 cn2an
 jieba
+openai>=1.0  # optional: for DALL-E 3 image generation
 # optional: whisperx  (install separately for word-level timestamps + diarization)
 # pip install whisperx
