@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.1] — 2026-09-08
+
+### Fixes
+- **Voice Memos picker now explains itself** (`app.py:list_voice_memos`): macOS TCC lets
+  `is_dir()` succeed on the Recordings directory even without Full Disk Access, so the
+  picker silently returned an empty dropdown. It now probes the directory with
+  `iterdir()` and, on `PermissionError`, returns a single option telling you to grant
+  Full Disk Access to the app that launched the process (System Settings → Privacy &
+  Security → Full Disk Access). Note that the *responsible* app is the one that needs
+  the grant — launch `app.py` from Terminal.app if the picker stays empty; the upload
+  path works regardless.
+
+### Docs
+- **`SPEC.md` added** — a 647-line implementation-agnostic specification of every feature
+  (signatures, models, verbatim prompts, data contracts, failure modes, config surface),
+  written so any stage can be reconstructed in another stack without reading the Python.
+- README: documented the Full Disk Access requirement, added `SPEC.md` and
+  `RESEARCH_IMAGE_QUALITY.md` to the documentation index, corrected the `transcribe.py`
+  module-reference row (SenseVoice is the default backend, not Whisper/WhisperX), and
+  updated the test count to 104.
+
 ## [0.3.0] — 2026-05-19
 
 ### Features
