@@ -124,6 +124,9 @@ VOICE_MEMOS_DIR = (
 _CORE_DATA_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 
+_FDA_REQUIRED = ("⚠️ Full Disk Access required — System Settings → Privacy & Security → Full Disk Access → add Terminal", "")
+
+
 def list_voice_memos(limit: int = 50) -> list[tuple[str, str]]:
     """Return [(label, path), ...] of recent Voice Memos, newest first.
 
@@ -132,6 +135,14 @@ def list_voice_memos(limit: int = 50) -> list[tuple[str, str]]:
     """
     if not VOICE_MEMOS_DIR.is_dir():
         return []
+
+    # macOS TCC gate: is_dir() passes even without Full Disk Access, but reads fail.
+    try:
+        next(VOICE_MEMOS_DIR.iterdir())
+    except PermissionError:
+        return [_FDA_REQUIRED]
+    except StopIteration:
+        pass  # directory exists but is empty — continue normally
 
     db = VOICE_MEMOS_DIR / "CloudRecordings.db"
     rows: list[tuple[str, str]] = []

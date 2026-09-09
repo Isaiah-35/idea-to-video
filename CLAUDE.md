@@ -65,7 +65,16 @@ bash make_video.sh ./topic_folder/ audio.wav output.mp4
 - Kokoro default voices: English → `af_heart`, Chinese → `zf_xiaobei`
 - ASR runs fully locally (no cloud). Default backend SenseVoice downloads ~1GB to `~/.cache/modelscope/` on first use.
 - Tab 1 has a Mac Voice Memos picker that reads `CloudRecordings.db` (read-only URI mode) — no drag-and-drop required.
+  It needs **Full Disk Access on the app that launched the process** (macOS grants TCC per responsible app), so a run
+  started from an IDE or a detached shell won't inherit a grant made to Terminal.app. Without access the picker returns a
+  single "Full Disk Access required" option rather than an empty list; the audio-upload path works either way.
 - All Claude-driven steps (cleanup, speaker labeling, topics, script) degrade gracefully on API failure; transcribe still returns text even when Claude is unreachable.
+
+## Specification
+
+`SPEC.md` is the implementation-agnostic spec for every stage — signatures, models, verbatim prompts, data contracts,
+failure modes, config surface. Read it before changing a stage's contract, and update it in the same commit when a
+contract, prompt, or default changes.
 
 ## Language Support
 

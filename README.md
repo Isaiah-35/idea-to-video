@@ -84,6 +84,12 @@ call returns unlabeled text rather than crashing.
 - Voice Memos picker: `list_voice_memos()` in [`app.py`](app.py); reads
   `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/CloudRecordings.db`
   in read-only URI mode so the live Voice Memos process is never locked.
+  **Requires Full Disk Access** (System Settings → Privacy & Security → Full Disk Access)
+  for the app that *launched* the process — macOS grants TCC per responsible app, so a run
+  started from an IDE or a detached shell is not covered by a grant to Terminal.app.
+  Without it the directory still passes `is_dir()` but reads fail, so the picker returns a
+  single "Full Disk Access required" option instead of a silently empty list. The plain
+  audio-upload path never needs the grant.
 - Override default backend: `SENSEVOICE_DISABLE=1` skips SenseVoice and falls through to MLX.
 - Gradio allow-list: `demo.launch(allowed_paths=[VOICE_MEMOS_DIR])` so the picker can hand
   paths outside the project tree to `gr.Audio`.
@@ -453,7 +459,7 @@ kokoro_tts.py          → audio files[]  (durations[])
 
 | Module | Role | Tests |
 |--------|------|-------|
-| [`transcribe.py`](transcribe.py) | Audio → text (Whisper/WhisperX) | [`test_transcribe.py`](tests/test_transcribe.py) |
+| [`transcribe.py`](transcribe.py) | Audio → text (SenseVoice / MLX / WhisperX / Whisper) | [`test_transcribe.py`](tests/test_transcribe.py) |
 | [`extract_topics.py`](extract_topics.py) | Transcript → structured topics | [`test_extract_topics.py`](tests/test_extract_topics.py) |
 | [`write_script.py`](write_script.py) | Topics → script / sections | [`test_write_script.py`](tests/test_write_script.py) |
 | [`hook_variants.py`](hook_variants.py) | Topics → 3 opening hooks | [`test_phase3_functions.py`](tests/test_phase3_functions.py) |
@@ -562,9 +568,11 @@ chains all stages and auto-populates the Repurpose tab with scene data.
 
 | Doc | What's in it |
 |-----|-------------|
+| [`SPEC.md`](SPEC.md) | Full feature specification — signatures, models, verbatim prompts, data contracts, failure modes, config surface. Implementation-agnostic: enough to rebuild any stage in another stack without reading the Python |
 | [`ROADMAP.md`](ROADMAP.md) | Product vision, competitive landscape, feature roadmap |
 | [`COMPETITIVE-UX.md`](COMPETITIVE-UX.md) | Deep competitive analysis — HeyGen, InVideo AI, Runway, Sora, Kling, Descript, LTX Studio |
 | [`RESEARCH_TRANSCRIPTION.md`](RESEARCH_TRANSCRIPTION.md) | Open-source transcription research — WhisperX, pyannote, NeMo, diarization trade-offs |
+| [`RESEARCH_IMAGE_QUALITY.md`](RESEARCH_IMAGE_QUALITY.md) | Image-quality root-cause diagnosis and the backend decisions that followed |
 | [`CHANGELOG.md`](CHANGELOG.md) | Version history |
 | [`CLAUDE.md`](CLAUDE.md) | Dev setup, pipeline architecture, language support notes |
 
@@ -574,5 +582,5 @@ chains all stages and auto-populates the Repurpose tab with scene data.
 
 ```bash
 .venv/bin/python -m pytest tests/ -q --ignore=tests/eval
-# 102 tests
+# 104 tests
 ```
